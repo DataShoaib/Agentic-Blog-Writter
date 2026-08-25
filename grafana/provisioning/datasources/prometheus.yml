@@ -1,0 +1,12 @@
+# Grafana datasource auto-provisioning.
+# This makes Prometheus available as a data source right after Grafana starts,
+# so dashboards can be built without manual setup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
