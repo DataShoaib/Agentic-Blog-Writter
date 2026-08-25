@@ -1,0 +1,16 @@
+# Grafana dashboard provider.
+# This tells Grafana to load any JSON dashboard files found in the
+# /dashboards folder automatically on startup.
+apiVersion: 1
+
+providers:
+  - name: "agentic-overview"
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

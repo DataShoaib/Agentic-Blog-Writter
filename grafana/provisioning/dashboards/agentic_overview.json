@@ -1,0 +1,130 @@
+{
+  "uid": "agentic-overview",
+  "title": "Agentic Blog Writer - Overview",
+  "tags": ["agentic", "llm", "prometheus"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Graph Runs",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(agentic_graph_completed_total)", "legendFormat": "Completed", "refId": "A" },
+        { "expr": "sum(agentic_graph_failures_total)", "legendFormat": "Failed", "refId": "B" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "all", "values": false },
+        "orientation": "horizontal",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "LLM Calls per min (by operation)",
+      "gridPos": { "h": 4, "w": 12, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (operation) (rate(agentic_llm_calls_total[5m]) * 60)", "legendFormat": "{{operation}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "cpm", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 20, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "LLM Errors / Retries / Fallbacks",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(agentic_llm_failures_total[5m]))", "legendFormat": "Failures", "refId": "A" },
+        { "expr": "sum(rate(agentic_llm_retries_total[5m]))", "legendFormat": "Retries", "refId": "B" },
+        { "expr": "sum(rate(agentic_llm_model_fallbacks_total[5m]))", "legendFormat": "Fallbacks", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Graph Latency (p95 / p50)",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(agentic_graph_latency_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "A" },
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(agentic_graph_latency_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list" } }
+    },
+    {
+      "id": 5,
+      "type": "gauge",
+      "title": "Job Queue Depth",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "agentic_job_queue_depth", "legendFormat": "queued", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 20, "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 15 } ] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "all", "values": false }, "showThresholdLabels": true, "showThresholdMarkers": true }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "LLM Success & Model Fallbacks (1h)",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(increase(agentic_llm_calls_total[1h]) - increase(agentic_llm_failures_total[1h]))", "legendFormat": "Success", "refId": "A" },
+        { "expr": "sum(increase(agentic_llm_model_fallbacks_total[1h]))", "legendFormat": "Fallbacks", "refId": "B" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "all", "values": false }, "orientation": "horizontal", "textMode": "value_and_name", "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Auth Failures & Rate-Limit Rejections",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(agentic_auth_failures_total[5m]))", "legendFormat": "Auth failures", "refId": "A" },
+        { "expr": "sum(rate(agentic_rate_limit_rejections_total[5m]))", "legendFormat": "Rate-limited", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Cache Hit Ratio",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(agentic_cache_hits_total) / (sum(agentic_cache_hits_total) + sum(agentic_cache_misses_total))", "legendFormat": "Hit ratio", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 } ] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "all", "values": false }, "orientation": "horizontal", "textMode": "value_and_name", "colorMode": "background", "graphMode": "area" }
+    }
+  ]
+}
