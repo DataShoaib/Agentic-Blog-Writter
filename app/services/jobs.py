@@ -30,8 +30,9 @@ JOBS_DB_PATH = "outputs/jobs.sqlite3"
 
 logger = logging.getLogger(__name__)
 
-# One compiled graph per process: the InMemorySaver checkpointer then persists
-# across jobs instead of being thrown away after every single generation.
+# One compiled graph per process: the SQLite checkpointer then keeps every
+# job's workflow state durable on disk across jobs and process restarts,
+# instead of living in RAM and vanishing after a single generation.
 _COMPILED_GRAPH = None
 
 

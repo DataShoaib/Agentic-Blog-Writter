@@ -63,7 +63,7 @@ FastAPI -----------------------> /metrics
 
 **Redis/RQ worker:** the API stores the job as `queued` in SQLite and publishes the work to Redis. A separate RQ worker consumes the job, runs the long graph, and updates SQLite with progress, results, or failures. The frontend continues polling the job-status endpoint, while Redis provides the cross-process queue and retry boundary.
 
-**LangGraph checkpointer:** stores workflow state against a `thread_id` for the life of the configured checkpointer. The local project uses `InMemorySaver`; a production deployment should switch to a durable database-backed LangGraph checkpointer.
+**LangGraph checkpointer:** stores the workflow state of every job against its `thread_id` (one thread per `job_id`) as the graph moves `router → research → planner → writers → merge → quality → revise → images`. In this project it runs on a durable SQLite saver (`outputs/checkpoints.sqlite3`), so a worker restart or in-process thread crash mid-generation keeps every checkpoint already written, and concurrent jobs stay isolated instead of sharing RAM state. A deployment that needs multi-process horizontal scaling can point the same code at a PostgreSQL checkpointer with no other changes.
 
 **SQLite job store:** tracks API-level status (`queued`, `running`, `completed`, `failed`) and the owner of each job. It is not a replacement for LangGraph checkpointing; the two solve different problems.
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from langgraph.checkpoint.memory import InMemorySaver
+import sqlite3
+from pathlib import Path
+
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 from langsmith import traceable
@@ -40,14 +43,36 @@ def traced(name: str, fn):
     return traceable(name=name, run_type="chain")(fn)
 
 
+CHECKPOINT_DB_PATH = Path(__file__).resolve().parents[2] / "outputs" / "checkpoints.sqlite3"
+
+_default_saver: SqliteSaver | None = None
+
+
+def _get_default_saver() -> SqliteSaver:
+    """Durable SQLite-backed checkpointer shared for the life of the process.
+
+    Storing each job's workflow state on disk (instead of in RAM) means a worker
+    that crashes or restarts mid-generation keeps every checkpoint it already
+    wrote, and jobs running in different threads stay isolated by thread_id.
+    """
+    global _default_saver
+    if _default_saver is None:
+        CHECKPOINT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _default_saver = SqliteSaver(conn)
+    return _default_saver
+
+
 def build_graph(checkpointer=None):
     """Compile the graph with a real checkpointer by default.
 
-    InMemorySaver is ideal for local/demo deployment and tests. For a horizontally
-    scaled production deployment, replace it with a database-backed checkpointer.
+    The default is a durable SqliteSaver persisted to outputs/checkpoints.sqlite3,
+    so per-job state survives process restarts instead of living in RAM. Tests and
+    specialised callers may inject their own saver (e.g. InMemorySaver) explicitly.
     """
     if checkpointer is None:
-        checkpointer = InMemorySaver()
+        checkpointer = _get_default_saver()
 
     graph = StateGraph(GraphState)
     graph.add_node("router", traced("router", router_node))
