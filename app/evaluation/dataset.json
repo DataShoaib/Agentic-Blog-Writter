@@ -1,0 +1,24 @@
+[
+  {
+    "topic": "Explain RAG evaluation for a technical audience",
+    "criteria": {
+      "must_cover": [
+        "retrieval quality",
+        "generation quality",
+        "latency",
+        "evaluation dataset"
+      ]
+    }
+  },
+  {
+    "topic": "Compare RAG and fine-tuning",
+    "criteria": {
+      "must_cover": [
+        "knowledge freshness",
+        "cost",
+        "latency",
+        "when to use each"
+      ]
+    }
+  }
+]
