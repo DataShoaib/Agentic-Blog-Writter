@@ -1,14 +1,22 @@
+"""Centralized LLM gateway built on LiteLLM.
+
+All chat traffic flows through :func:`invoke_text` and :func:`invoke_structured`.
+LiteLLM normalizes the provider API surface, so the gateway only adds what the
+application actually needs: model fallback, transient retries, token-usage
+accounting, and Prometheus metrics.
+"""
+
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
 import time
-from collections.abc import Callable
 from typing import Any, TypeVar
 
-from langchain_core.messages import BaseMessage, SystemMessage
-from langchain_groq import ChatGroq
+from litellm import completion as _litellm_completion
+from pydantic import BaseModel
 
 from app.config import APP_CONFIG, get_secrets
 from app.observability.metrics import (
@@ -17,7 +25,6 @@ from app.observability.metrics import (
     LLM_MODEL_FALLBACKS,
     LLM_RETRIES,
 )
-from app.observability.tracing import configure_langsmith
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +32,78 @@ T = TypeVar("T")
 
 RATE_LIMIT_RETRY_SECONDS = 12
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-# Desired output sizes handed to the TPM-aware budget (input+output must fit
-# inside one free-tier window; see _output_budget).
 TEXT_OUTPUT_TOKENS = 1300
 STRUCTURED_OUTPUT_TOKENS = 3400
+
+# Module-level seam so tests can stub the transport without patching litellm.
+_completion = _litellm_completion
+
+# Per-call token usage, reported by the evaluation runner.
+_TOKEN_USAGE: list[dict] = []
 
 
 class LLMGatewayError(RuntimeError):
     """Raised when every configured model and retry attempt has been exhausted."""
 
+
+class _EmptyContentError(RuntimeError):
+    """The model answered but produced no usable text; retry/fallback applies."""
+
+
+def model_candidates() -> list[str]:
+    """Ordered litellm model names: primary first, then configured fallbacks.
+
+    Configured names (e.g. "openai/gpt-oss-20b", "qwen/qwen3.6-27b") are Groq
+    model ids, not litellm provider routes — they are all routed through the
+    ``groq/`` provider so litellm talks to the Groq API with GROQ_API_KEY.
+    """
+    secrets = get_secrets()
+    primary = secrets.groq_model or APP_CONFIG.groq_model
+    overrides = [
+        name.strip()
+        for name in getattr(secrets, "groq_fallback_models", "").split(",")
+        if name.strip()
+    ]
+    names = [primary, *(overrides or list(APP_CONFIG.llm_fallback_models))]
+
+    candidates: list[str] = []
+    for name in names:
+        if not name:
+            continue
+        routed = name if name.startswith("groq/") else f"groq/{name}"
+        if routed not in candidates:
+            candidates.append(routed)
+
+    if not candidates:
+        raise RuntimeError("No LLM model is configured.")
+    return candidates
+
+
+def _ordered_candidates(preferred_model: str | None) -> list[str]:
+    """Fallback order starting from ``preferred_model`` when it is a candidate.
+
+    Keeps the same overall fallback chain but lets callers (e.g. parallel
+    section workers) start on different models so bursts spread across
+    separate provider rate-limit buckets instead of hammering one pool.
+    """
+    base = model_candidates()
+    if preferred_model and preferred_model in base:
+        index = base.index(preferred_model)
+        return base[index:] + base[:index]
+    return base
+
+
+def _to_litellm_messages(messages: list[Any]) -> list[dict[str, str]]:
+    """Accept langchain BaseMessage objects or plain {role, content} dicts."""
+    role_map = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+    converted: list[dict[str, str]] = []
+    for message in messages:
+        if isinstance(message, dict):
+            converted.append({"role": message.get("role", "user"), "content": message.get("content", "")})
+            continue
+        role = getattr(message, "type", None) or "user"
+        converted.append({"role": role_map.get(role, role), "content": str(getattr(message, "content", ""))})
+    return converted
 
 def _status_code(exc: Exception) -> int | None:
     status_code = getattr(exc, "status_code", None)
@@ -59,7 +129,10 @@ def _is_json_generation_error(exc: Exception) -> bool:
 
 
 def _is_transient_error(exc: Exception) -> bool:
-    """Mirror the transient classification used by the Tavily search service."""
+    # Empty generations are stochastic: a retry (or fallback model) frequently
+    # succeeds, so they must not be treated as permanent faults.
+    if isinstance(exc, _EmptyContentError):
+        return True
     if _is_rate_limit_error(exc) or _status_code(exc) in RETRYABLE_STATUS_CODES:
         return True
     # Invalid-JSON generations are stochastic: a retry (or fallback model)
@@ -80,150 +153,135 @@ def _backoff_delay(attempt: int) -> float:
     return min(delay * random.uniform(0.8, 1.2), APP_CONFIG.llm_retry_backoff_cap_seconds)
 
 
-def _content_text(response: Any) -> str:
-    content = getattr(response, "content", "")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text")
-            else:
-                text = getattr(block, "text", None)
-            if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
-        return "\n".join(parts)
-    return ""
+def _record_token_usage(response: Any) -> None:
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    completion = getattr(usage, "completion_tokens", 0) or 0
+    if not prompt and not completion:
+        return
+    _TOKEN_USAGE.append({
+        "model": getattr(response, "model", "") or "",
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+    })
 
 
-def get_llm(model: str | None = None, *, max_tokens: int | None = None) -> ChatGroq:
+def get_recorded_token_usage() -> list[dict]:
+    """Token usage per call, consumed by the evaluation runner's cost report."""
+    return [dict(entry) for entry in _TOKEN_USAGE]
+
+
+def _estimate_input_tokens(messages: list[dict[str, str]]) -> int:
+    """Count input tokens, falling back to a chars/4 estimate if the
+    tokenizer is unavailable (keeps the gateway dependency-light)."""
+    try:
+        from litellm import token_counter
+        count = token_counter(messages=messages)
+        if isinstance(count, (int, float)) and count > 0:
+            return int(count)
+    except Exception:
+        pass
+    return sum(len(m.get("content", "")) for m in messages) // 4
+
+
+def _output_budget(messages: list[dict[str, str]], desired_output_tokens: int) -> int:
+    """Shrink the output cap so input+output fits one free-tier TPM window.
+
+    Groq returns 413 when a single request exceeds the TPM window, which on
+    the free tier is small. Keep the request under ``llm_request_token_budget``
+    but never shrink below a workable minimum.
+    """
+    remaining = APP_CONFIG.llm_request_token_budget - _estimate_input_tokens(messages)
+    return max(256, min(desired_output_tokens, remaining, APP_CONFIG.llm_max_output_tokens))
+
+
+def _call(
+    model: str,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+    response_format: type[BaseModel] | None = None,
+) -> Any:
+    """Single litellm.completion attempt."""
+    api_key = get_secrets().groq_api_key
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "api_key": api_key,
+        "num_retries": 0,  # the gateway owns the retry policy
+        "timeout": APP_CONFIG.request_timeout_seconds,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    return _completion(**kwargs)
+
+
+def _response_text(response: Any) -> str:
+    """Extract plain text from a litellm completion response."""
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError):
+        return ""
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _extract_json(text: str) -> str:
+    """Best-effort extraction of a JSON object/array from model text."""
+    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        return text
+    return text[min(starts):]
+
+
+def _invoke(
+    messages: list[Any],
+    *,
+    operation: str,
+    preferred_model: str | None,
+    max_tokens: int,
+    response_format: type[BaseModel] | None = None,
+) -> str:
+    """Retry/fallback core shared by invoke_text and invoke_structured."""
     secrets = get_secrets()
     if not secrets.groq_api_key:
         raise RuntimeError("GROQ_API_KEY is not configured.")
 
-    resolved = model or secrets.groq_model or APP_CONFIG.groq_model
-    options: dict[str, Any] = {
-        "model": resolved,
-        "groq_api_key": secrets.groq_api_key,
-        "temperature": 0,
-        # Per-attempt timeout; the gateway below owns the retry policy.
-        "timeout": APP_CONFIG.request_timeout_seconds,
-        "max_retries": 0,
-    }
-    if resolved.startswith("openai/gpt-oss"):
-        options["reasoning_format"] = "hidden"
-        options["reasoning_effort"] = "low"
-        options["max_tokens"] = max_tokens or APP_CONFIG.llm_max_output_tokens
-    return ChatGroq(**options)
-
-
-def _estimate_input_tokens(messages: list[BaseMessage] | None) -> int:
-    """Cheap chars/3.5 heuristic; good enough to stay under a TPM budget."""
-    if not messages:
-        return 0
-    chars = 0
-    for message in messages:
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            chars += len(content)
-        else:
-            chars += len(str(content))
-    return int(chars / 3.5) + 64
-
-
-def _output_budget(messages: list[BaseMessage], desired_output_tokens: int) -> int:
-    """Fit input+output inside one free-tier TPM window (Groq counts both).
-
-    Requesting ``max_tokens`` larger than the remaining TPM makes even tiny
-    prompts fail with 413 "Request too large", so the output cap shrinks to
-    whatever room is actually left.
-    """
-    room = APP_CONFIG.llm_request_token_budget - _estimate_input_tokens(messages)
-    return max(512, min(desired_output_tokens, room))
-
-
-def get_llm_for_messages(
-    model: str,
-    messages: list[BaseMessage],
-    desired_output_tokens: int,
-):
-    """get_llm variant whose output cap adapts to the message size."""
-    client = get_llm(model)
-    try:
-        client.max_tokens = _output_budget(messages, desired_output_tokens)
-    except Exception:  # pragma: no cover - best-effort attribute tweak
-        pass
-    return client
-
-
-def model_candidates() -> list[str]:
-    """Ordered chat models: primary first, then configured fallbacks."""
-    secrets = get_secrets()
-    primary = secrets.groq_model or APP_CONFIG.groq_model
-    override = [
-        name.strip()
-        for name in getattr(secrets, "groq_fallback_models", "").split(",")
-        if name.strip()
-    ]
-    candidates = [primary]
-    for name in override or list(APP_CONFIG.llm_fallback_models):
-        if name != primary and name not in candidates:
-            candidates.append(name)
-    return candidates
-
-
-def _ordered_candidates(preferred_model: str | None) -> list[str]:
-    """Fallback order starting from ``preferred_model`` when it is a candidate.
-
-    Keeps the same overall fallback chain but lets callers (e.g. parallel
-    section workers) start on different models so bursts spread across
-    separate provider rate-limit buckets instead of hammering one pool.
-    """
-    base = model_candidates()
-    if preferred_model and preferred_model in base:
-        index = base.index(preferred_model)
-        return base[index:] + base[:index]
-    return base
-
-
-def _call_with_gateway(
-    build_call: Callable[[ChatGroq], Callable[[], Any]],
-    *,
-    operation: str,
-    require_non_empty: bool = False,
-    preferred_model: str | None = None,
-    messages: list[BaseMessage] | None = None,
-    desired_output_tokens: int | None = None,
-) -> Any:
-    """Run one logical LLM operation with bounded retries and model fallbacks.
-
-    For each candidate model (primary first, then configured fallbacks) the call
-    is attempted up to ``APP_CONFIG.llm_max_attempts_per_model`` times. Transient
-    faults (timeouts, connection errors, HTTP 408/429/5xx) back off exponentially;
-    permanent faults switch to the next fallback model immediately. Rate-limit
-    responses honor Groq's "try again in Xs" hint. Raises LLMGatewayError when
-    every option has been exhausted.
-    """
+    converted = _to_litellm_messages(messages)
+    max_tokens = _output_budget(converted, max_tokens)
     candidates = _ordered_candidates(preferred_model)
     max_attempts = max(1, APP_CONFIG.llm_max_attempts_per_model)
     last_exc: Exception | None = None
 
     for index, model in enumerate(candidates):
-        if messages is not None and desired_output_tokens:
-            client = get_llm_for_messages(model, messages, desired_output_tokens)
-        else:
-            client = get_llm(model)
-        call = build_call(client)
         for attempt in range(1, max_attempts + 1):
             try:
-                response = call()
+                response = _call(
+                    model, converted, max_tokens=max_tokens, response_format=response_format
+                )
+                _record_token_usage(response)
+                text = _response_text(response)
+                if not text:
+                    raise _EmptyContentError(
+                        f"LLM returned empty content for operation '{operation}'."
+                    )
+                logger.info(
+                    "llm operation=%s succeeded with model=%s on attempt %d",
+                    operation, model, attempt,
+                )
+                return text
             except Exception as exc:
                 last_exc = exc
                 if not _is_transient_error(exc):
                     logger.warning(
-                        "llm operation=%s model=%s non-retryable %s: %s",
-                        operation, model, type(exc).__name__, exc,
+                        "llm operation=%s model=%s permanent %s; moving to next model",
+                        operation, model, type(exc).__name__,
                     )
                     break  # stop burning retries on this model; try the next one
                 if attempt < max_attempts:
@@ -239,23 +297,6 @@ def _call_with_gateway(
                         operation, model, type(exc).__name__, attempt, max_attempts, delay,
                     )
                     time.sleep(delay)
-                continue
-
-            if not require_non_empty or _content_text(response):
-                logger.info(
-                    "llm operation=%s succeeded with model=%s on attempt %d",
-                    operation, model, attempt,
-                )
-                return response
-
-            last_exc = RuntimeError(f"LLM returned empty content for operation '{operation}'.")
-            logger.warning(
-                "llm operation=%s model=%s returned empty content on attempt %d/%d",
-                operation, model, attempt, max_attempts,
-            )
-            if attempt < max_attempts:
-                LLM_RETRIES.labels(operation=operation).inc()
-                time.sleep(_backoff_delay(attempt))
 
         if index < len(candidates) - 1:
             LLM_MODEL_FALLBACKS.labels(operation=operation).inc()
@@ -270,22 +311,20 @@ def _call_with_gateway(
 
 
 def invoke_text(
-    messages: list[BaseMessage],
+    messages: list[Any],
     *,
     operation: str,
     preferred_model: str | None = None,
 ) -> str:
+    """Generate free-form text; retries transient errors, falls back models."""
     LLM_CALLS.labels(operation=operation).inc()
     try:
-        response = _call_with_gateway(
-            lambda client: lambda: client.invoke(messages),
+        return _invoke(
+            messages,
             operation=operation,
-            require_non_empty=True,
             preferred_model=preferred_model,
-            messages=messages,
-            desired_output_tokens=TEXT_OUTPUT_TOKENS,
+            max_tokens=TEXT_OUTPUT_TOKENS,
         )
-        return _content_text(response)
     except Exception as exc:
         LLM_FAILURES.labels(operation=operation).inc()
         logger.error("llm operation=%s failed permanently: %s", operation, exc)
@@ -294,25 +333,41 @@ def invoke_text(
 
 def invoke_structured(
     schema: type[T],
-    messages: list[BaseMessage],
+    messages: list[Any],
     *,
     operation: str,
     preferred_model: str | None = None,
 ) -> T:
+    """Generate a Pydantic ``schema`` instance; same retry/fallback policy."""
     LLM_CALLS.labels(operation=operation).inc()
     structured_messages = [
-        SystemMessage(content="Return only valid JSON matching the requested schema."),
-        *messages,
+        {"role": "system", "content": "Return only valid JSON matching the requested schema."},
+        *_to_litellm_messages(messages),
     ]
     try:
-        return _call_with_gateway(
-            lambda client: lambda: client.with_structured_output(schema, method="json_schema").invoke(structured_messages),
+        text = _invoke(
+            structured_messages,
             operation=operation,
             preferred_model=preferred_model,
-            messages=structured_messages,
-            desired_output_tokens=STRUCTURED_OUTPUT_TOKENS,
+            max_tokens=STRUCTURED_OUTPUT_TOKENS,
+            response_format=(
+                schema
+                if isinstance(schema, type) and issubclass(schema, BaseModel)
+                else None
+            ),
         )
+        return _parse_structured(schema, text)
     except Exception as exc:
         LLM_FAILURES.labels(operation=operation).inc()
         logger.error("llm operation=%s failed permanently: %s", operation, exc)
         raise
+
+
+def _parse_structured(schema: type[T], text: str) -> T:
+    """Validate model output against ``schema``, tolerating prose-wrapped JSON."""
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        try:
+            return schema.model_validate_json(text)
+        except Exception:
+            return schema.model_validate_json(_extract_json(text))
+    return json.loads(_extract_json(text))  # type: ignore[return-value]

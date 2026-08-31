@@ -1,7 +1,8 @@
-"""Hermetic unit tests for the centralized LLM retry/fallback gateway."""
+"""Hermetic unit tests for the LiteLLM-based retry/fallback gateway."""
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -16,38 +17,26 @@ def _sample(name: str, labels: dict) -> float | None:
     return REGISTRY.get_sample_value(name, labels)
 
 
-class FakeLLM:
-    """Minimal ChatGroq stand-in whose behaviour is scripted per model name."""
-
-    def __init__(self, script_factory):
-        self._script_factory = script_factory
-        self.model = ""
-
-    def invoke(self, messages):
-        return self._script_factory(self.model)(messages)
-
-    def with_structured_output(self, schema, method=None):
-        outer = self
-
-        class _Structured:
-            def invoke(self, messages):
-                return outer._script_factory(outer.model)(messages)
-
-        return _Structured()
+def _resp(content: str, model: str = "test-model"):
+    return SimpleNamespace(
+        model=model,
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=None,
+    )
 
 
 @pytest.fixture
 def gateway(monkeypatch):
-    """Install a deterministic model chain and stub client creation."""
+    """Install a deterministic model chain and a scripted fake completion."""
 
     def install(models, script_factory, attempts=2, backoff=0.0, cap=0.0):
         requested: list[str] = []
 
-        def fake_get_llm(model=None):
-            client = FakeLLM(script_factory)
-            client.model = model or models[0]
-            requested.append(client.model)
-            return client
+        def fake_completion(**kwargs):
+            model = kwargs["model"]
+            if model not in requested:  # record routes once per model, like clients
+                requested.append(model)
+            return script_factory(model)(kwargs["messages"])
 
         def fake_secrets():
             return SimpleNamespace(
@@ -64,7 +53,7 @@ def gateway(monkeypatch):
             llm_retry_backoff_cap_seconds=cap,
             llm_fallback_models=tuple(models[1:]),
         )
-        monkeypatch.setattr(llm, "get_llm", fake_get_llm)
+        monkeypatch.setattr(llm, "_completion", fake_completion)
         monkeypatch.setattr(llm, "get_secrets", fake_secrets)
         monkeypatch.setattr(llm, "APP_CONFIG", cfg)
 
@@ -75,6 +64,28 @@ def gateway(monkeypatch):
     return install
 
 
+def test_model_candidates_route_through_groq_provider(monkeypatch):
+    names = ["openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/llama-3.3-70b"]
+    monkeypatch.setattr(
+        llm,
+        "get_secrets",
+        lambda: SimpleNamespace(groq_model=names[0], groq_fallback_models=""),
+    )
+    monkeypatch.setattr(
+        llm,
+        "APP_CONFIG",
+        AppConfig(groq_model=names[0], llm_fallback_models=(names[1], names[2])),
+    )
+
+    routed = llm.model_candidates()
+
+    assert routed == [
+        "groq/openai/gpt-oss-20b",
+        "groq/qwen/qwen3.6-27b",
+        "groq/llama-3.3-70b",
+    ]
+
+
 def test_retries_transient_error_on_same_model(gateway):
     calls = {"count": 0}
 
@@ -83,7 +94,7 @@ def test_retries_transient_error_on_same_model(gateway):
             calls["count"] += 1
             if calls["count"] == 1:
                 raise TimeoutError("upstream timed out")
-            return SimpleNamespace(content="section text")
+            return _resp("section text", model)
 
         return handler
 
@@ -92,7 +103,7 @@ def test_retries_transient_error_on_same_model(gateway):
     result = llm.invoke_text([SimpleNamespace(content="hi")], operation="t-retry")
 
     assert result == "section text"
-    assert requested == ["primary-model"]  # never fell back
+    assert requested == ["groq/primary-model"]  # never fell back
     assert len(sleeps) == 1  # exactly one backoff sleep
     assert _sample("agentic_llm_retries_total", {"operation": "t-retry"}) == 1.0
 
@@ -115,9 +126,9 @@ def test_rate_limit_honours_try_again_hint(gateway):
 def test_permanent_error_switches_to_fallback_immediately(gateway):
     def script_factory(model):
         def handler(messages):
-            if model == "primary-model":
+            if model == "groq/primary-model":
                 raise ValueError("invalid request shape")
-            return SimpleNamespace(content="fallback text")
+            return _resp("fallback text", model)
 
         return handler
 
@@ -126,8 +137,8 @@ def test_permanent_error_switches_to_fallback_immediately(gateway):
     result = llm.invoke_text([SimpleNamespace(content="hi")], operation="t-fb")
 
     assert result == "fallback text"
-    assert requested[0] == "primary-model"
-    assert "fallback-model" in requested
+    assert requested[0] == "groq/primary-model"
+    assert "groq/fallback-model" in requested
     assert sleeps == []  # no retries burned on the broken primary
     assert _sample("agentic_llm_model_fallbacks_total", {"operation": "t-fb"}) == 1.0
 
@@ -147,7 +158,7 @@ def test_all_models_exhausted_raises_gateway_error(gateway):
     with pytest.raises(llm.LLMGatewayError):
         llm.invoke_text([SimpleNamespace(content="hi")], operation="t-dead")
 
-    assert requested == ["primary", "fallback-a"]  # client built once per model
+    assert requested == ["groq/primary", "groq/fallback-a"]  # one route per model
     assert calls["count"] == 4  # 2 models x 2 attempts
     assert len(sleeps) == 2  # one backoff per model's first failure
     assert _sample("agentic_llm_calls_total", {"operation": "t-dead"}) == 1.0
@@ -155,9 +166,7 @@ def test_all_models_exhausted_raises_gateway_error(gateway):
 
 
 def test_empty_content_is_retried_then_succeeds(gateway):
-    responses = iter(
-        [SimpleNamespace(content="   "), SimpleNamespace(content="real text")]
-    )
+    responses = iter([_resp("   "), _resp("real text")])
 
     def script_factory(model):
         def handler(messages):
@@ -170,7 +179,7 @@ def test_empty_content_is_retried_then_succeeds(gateway):
     result = llm.invoke_text([SimpleNamespace(content="hi")], operation="t-empty")
 
     assert result == "real text"
-    assert requested == ["primary-model"]
+    assert requested == ["groq/primary-model"]
     assert len(sleeps) == 1
 
 
@@ -181,9 +190,9 @@ class Judge(BaseModel):
 def test_structured_output_uses_fallback_chain(gateway):
     def script_factory(model):
         def handler(messages):
-            if model == "primary":
+            if model == "groq/primary":
                 raise ValueError("schema rejected")
-            return Judge(value=42)
+            return _resp(json.dumps({"value": 42}), model)
 
         return handler
 
@@ -194,7 +203,54 @@ def test_structured_output_uses_fallback_chain(gateway):
     )
 
     assert result.value == 42
-    assert requested == ["primary", "secondary"]
+    assert requested == ["groq/primary", "groq/secondary"]
+
+
+def test_structured_output_parses_prose_wrapped_json(gateway):
+    def script_factory(model):
+        def handler(messages):
+            return _resp("Here is the answer:\n```json\n{\"value\": 7}\n```", model)
+
+        return handler
+
+    gateway(("primary",), script_factory)
+
+    result = llm.invoke_structured(
+        Judge, [SimpleNamespace(content="hi")], operation="t-prose"
+    )
+
+    assert result.value == 7
+
+
+def test_token_usage_is_recorded(gateway):
+    def script_factory(model):
+        def handler(messages):
+            return SimpleNamespace(
+                model=model,
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+            )
+
+        return handler
+
+    gateway(("primary",), script_factory)
+    llm._TOKEN_USAGE.clear()
+
+    llm.invoke_text([SimpleNamespace(content="hi")], operation="t-usage")
+
+    assert llm.get_recorded_token_usage() == [
+        {"model": "groq/primary", "prompt_tokens": 10, "completion_tokens": 5}
+    ]
+
+
+def test_output_budget_stays_under_tpm_window(monkeypatch):
+    monkeypatch.setattr(
+        llm, "_estimate_input_tokens", lambda messages: 7000
+    )  # big research context
+
+    budget = llm._output_budget([], TEXT_DESIRED := 1300)
+
+    assert budget == 600  # 7600 - 7000 remaining, floored at the minimum
 
 
 def test_gateway_config_defaults_are_sane():
