@@ -45,7 +45,7 @@ class Plan(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    title: str = Field(default="", max_length=300)
+    title: str = Field(default="", max_length=600)
     url: str = Field(min_length=10, max_length=2000)
     published_at: Optional[str] = None
     snippet: Optional[str] = Field(default=None, max_length=2000)
@@ -71,6 +71,10 @@ class ImageSpec(BaseModel):
     caption: str = Field(min_length=3, max_length=300)
     prompt: str = Field(min_length=20, max_length=2000)
     aspect_ratio: Literal["1:1", "16:9", "9:16"] = "16:9"
+    # Optional Mermaid diagram code (e.g. "graph LR; A --> B"). When present,
+    # the diagram is rendered deterministically with crisp text labels instead
+    # of an AI image model.
+    mermaid: str = Field(default="", max_length=4000)
 
 
 class GlobalImagePlan(BaseModel):

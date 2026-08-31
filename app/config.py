@@ -13,7 +13,7 @@ class Secrets(BaseSettings):
 
     groq_api_key: str = ""
     tavily_api_key: str = ""
-    google_api_key: str = ""
+    pollinations_api_key: str = ""
     langsmith_api_key: str = ""
     jwt_secret_key: str = ""
     redis_url: str = ""
@@ -35,7 +35,7 @@ class AppConfig:
     """Committed application behaviour; change here, not in .env."""
 
     groq_model: str = "openai/gpt-oss-20b"
-    image_model: str = "gemini-2.5-flash-image"
+    image_model: str = "gemini"
     max_workers: int = 4
     max_revision_attempts: int = 2
     max_research_results: int = 3

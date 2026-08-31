@@ -21,7 +21,12 @@ from app.graph.schemas import (
 from app.graph.state import GraphState
 from app.services.citations import validate_citations
 from app.services.images import generate_image
-from app.services.llm import invoke_structured, invoke_text, model_candidates
+from app.services.llm import (
+    LLMGatewayError,
+    invoke_structured,
+    invoke_text,
+    model_candidates,
+)
 from app.services.search import dedupe_and_filter, search_web
 
 logger = logging.getLogger(__name__)
@@ -324,20 +329,36 @@ def quality_gate(state: GraphState) -> dict:
         raise ValueError("Quality gate requires a plan.")
 
     evidence = [item.model_dump() for item in state.get("evidence", [])[:10]]
-    result = invoke_structured(
-        QualityResult,
-        [
-            SystemMessage(content=QUALITY_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Plan: {plan.model_dump()}\n"
-                    f"Evidence: {evidence[:10]}\n"
-                    f"Content:\n{state['merged_md']}"
-                )
-            ),
-        ],
-        operation="quality_gate",
-    )
+    try:
+        result = invoke_structured(
+            QualityResult,
+            [
+                SystemMessage(content=QUALITY_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Plan: {plan.model_dump()}\n"
+                        f"Evidence: {evidence[:10]}\n"
+                        f"Content:\n{state['merged_md']}"
+                    )
+                ),
+            ],
+            operation="quality_gate",
+        )
+    except LLMGatewayError as exc:
+        # The merged article already exists; losing it to an LLM quota error
+        # would waste the whole run. Degrade: keep the content, note the skip,
+        # and let the (LLM-free) citation check below still contribute.
+        logger.warning("quality gate skipped: %s", exc)
+        result = QualityResult(
+            passed=True,
+            factuality_score=0.75,
+            completeness_score=0.75,
+            citation_score=0.75,
+            issues=["Quality gate skipped: LLM quota exhausted; article was not LLM-reviewed."],
+        )
+        skipped = True
+    else:
+        skipped = False
 
     citations_required = any(task.requires_citations for task in plan.tasks)
     citation_score, citation_issues = validate_citations(
@@ -371,6 +392,10 @@ def quality_gate(state: GraphState) -> dict:
         and result.citation_score >= 0.75
         and not any(issue.startswith("Article too short") for issue in result.issues)
     )
+    if skipped:
+        # Quota is already gone; a revision attempt would fail too. Ship the
+        # article with the skip note instead of burning the job.
+        result.passed = True
     return {"quality": result.model_dump()}
 
 
@@ -422,12 +447,32 @@ Choose at most 3 diagrams that materially improve understanding.
 Prefer architecture, workflow, lifecycle, or comparison visuals.
 Avoid decoration.
 If no diagram is useful, return the original Markdown and an empty image list.
-Use placeholders exactly [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]]."""
+Use placeholders exactly [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+
+For every image you MUST also provide a "mermaid" field containing valid
+Mermaid diagram code (flowchart, sequence, or class diagram) that captures the
+same structure as the prompt, e.g.:
+"graph LR; A[Input] --> B[Attention]; B --> C[Output]"
+Rules: use only Mermaid v10 syntax; quote labels containing special
+characters; keep under 25 nodes; never call external services. The mermaid
+code is rendered with crisp text labels, so node labels must be concise and
+readable."""
+
+# Cap the article sent to image planning (~1200 tokens) so the request fits
+# within small LLM rate-limit budgets such as the Groq free tier (8k TPM).
+_IMAGE_PLANNING_MAX_CHARS = 4800
 
 
 def decide_images(state: GraphState) -> dict:
     if not state.get("enable_images", True):
         return {"merged_md": state["merged_md"], "image_specs": []}
+
+    # Trim the article for planning: the visual editor only needs structure
+    # (headings + surrounding text), and small LLM budgets (e.g. Groq free
+    # tier TPM limits) cannot fit a full-length article.
+    article = state["merged_md"]
+    if len(article) > _IMAGE_PLANNING_MAX_CHARS:
+        article = article[:_IMAGE_PLANNING_MAX_CHARS] + "\n\n[...article truncated...]"
 
     plan = invoke_structured(
         GlobalImagePlan,
@@ -436,7 +481,7 @@ def decide_images(state: GraphState) -> dict:
             HumanMessage(
                 content=(
                     f"Topic: {state['topic']}\n"
-                    f"Article:\n{state['merged_md']}"
+                    f"Article:\n{article}"
                 )
             ),
         ],
@@ -477,7 +522,12 @@ def generate_and_place_images(state: GraphState) -> dict:
         path = asset_dir / filename
         try:
             if not path.exists():
-                generate_image(spec["prompt"], path, spec.get("aspect_ratio", "16:9"))
+                generate_image(
+                    spec["prompt"],
+                    path,
+                    spec.get("aspect_ratio", "16:9"),
+                    mermaid=spec.get("mermaid", "") or "",
+                )
             image_url = f"/assets/images/{asset_dir.name}/{filename}"
             replacement = f"![{spec['alt']}]({image_url})\n*{spec['caption']}*"
         except Exception as exc:

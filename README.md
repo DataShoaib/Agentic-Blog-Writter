@@ -11,7 +11,7 @@ A production-oriented research-to-content system built around LangGraph. The poi
 - Parallel section workers with deterministic ordering
 - Citation allow-list validation
 - Quality gate with a bounded revision loop
-- Optional contextual diagram generation with Gemini
+- Optional contextual diagram generation with Pollinations ("gemini" image model)
 - Redis/RQ background job execution with a separate worker process, and an in-process thread executor that takes over automatically when Redis is down or no worker is running
 - Per-user JWT authentication and job ownership
 - Redis-backed search caching and rate limiting, with a local fallback when Redis is unavailable
@@ -201,10 +201,10 @@ Web research:
 TAVILY_API_KEY=...
 ```
 
-Images:
+Images (Pollinations — https://pollinations.ai, with Google "gemini" image model):
 
 ```env
-GOOGLE_API_KEY=...
+POLLINATIONS_API_KEY=...
 ```
 
 Redis (recommended for a multi-instance deployment and enabled by the included Compose file):
@@ -255,13 +255,22 @@ Then use the Swagger UI at `http://localhost:8000/docs`.
 
 ## Evaluation
 
-The evaluator is an executable workflow, not a placeholder. It runs each dataset case through the graph and then asks a structured judge to score the generated article.
+The evaluation layer is fully executable: `app/evaluation/` contains deterministic
+Python checks, 7 LLM-as-a-judge evaluators (Pydantic-validated structured output),
+exactly 8 golden cases (`golden_cases.json`) and a runner that executes the
+existing graph unchanged, then stores per-case JSON plus an aggregate summary.
 
 ```bash
-python -m app.evaluation.evaluator
+python -m app.evaluation.runner
 ```
 
-The evaluator disables image generation itself so image generation does not dominate cost or latency.
+Per-case results are written to `app/evaluation/results/<case_id>.json` and the
+aggregate (semantic pass rates, P95 latency, cost when token usage is available)
+to `app/evaluation/results/summary.json`. Deterministic checks only — no API key:
+
+```bash
+python -m pytest tests/test_evaluation_deterministic.py -q
+```
 
 ## Observability
 
