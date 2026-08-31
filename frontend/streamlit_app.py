@@ -135,6 +135,33 @@ def bundle_bytes(markdown: str, title: str) -> bytes:
     return buffer.getvalue()
 
 
+def load_blog(token: str, job_id: str) -> None:
+    """Load a previously generated blog into the workspace from its job record."""
+    try:
+        response = api_request(
+            "GET", f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"}
+        )
+    except requests.RequestException as exc:
+        st.error(f"Could not reach the backend: {exc}")
+        return
+    if not response.ok:
+        show_error(response)
+        return
+    job = response.json()
+    if job.get("status") != "completed":
+        st.warning(f"Blog {job_id} is not completed (status: {job.get('status')}).")
+        return
+    st.session_state.last_content = job.get("content", "")
+    st.session_state.last_job_id = job_id
+    st.session_state.last_plan = job.get("plan")
+    st.session_state.last_evidence = job.get("evidence", [])
+    st.session_state.last_stage = job.get("stage", "completed")
+    st.session_state.last_created_at = job.get("created_at")
+    st.session_state.last_updated_at = job.get("updated_at")
+    st.session_state.last_executor = "cached"
+    st.rerun()
+
+
 def signup_panel() -> None:
     with st.form("signup-form"):
         username = st.text_input("Username", placeholder="writer")
@@ -189,6 +216,36 @@ def authenticated_workspace() -> None:
         )
         st.session_state["research_mode"] = {"Auto": "auto", "Always": "force", "Never": "skip"}[research_label]
         submitted = st.button("Generate Blog", type="primary", use_container_width=True)
+        st.divider()
+
+        # Per-user blog history: every blog this user generated, selectable.
+        st.subheader("My past blogs")
+        try:
+            resp = api_request(
+                "GET", "/api/v1/blogs", headers={"Authorization": f"Bearer {token}"}
+            )
+        except requests.RequestException:
+            resp = None
+        if resp is not None and resp.ok:
+            blogs = resp.json().get("blogs", [])
+            if not blogs:
+                st.caption("No blogs generated yet.")
+            else:
+                labels = [
+                    f"{b['title']}  ·  {b['job_id'][:8]}" for b in blogs
+                ]
+                chosen = st.radio(
+                    "Select a blog to reload",
+                    labels,
+                    key="past_blog_radio",
+                    label_visibility="collapsed",
+                )
+                if st.button("Load selected blog", use_container_width=True):
+                    index = labels.index(chosen)
+                    load_blog(token, blogs[index]["job_id"])
+        else:
+            st.caption("Could not load blog history.")
+
         st.divider()
         if st.button("Log out", use_container_width=True):
             st.session_state.pop("token", None)

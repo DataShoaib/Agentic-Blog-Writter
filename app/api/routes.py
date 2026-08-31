@@ -8,6 +8,8 @@ from fastapi.security import OAuth2PasswordRequestForm
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.api.schemas import (
+    BlogListResponse,
+    BlogSummary,
     GenerateRequest,
     GenerateResponse,
     SignupRequest,
@@ -113,6 +115,40 @@ def job(
     )
 
 
+@router.get("/blogs", response_model=BlogListResponse)
+def list_blogs(user_id: Annotated[str, Depends(get_current_user)]):
+    """Return every blog the current user has generated, newest first.
+
+    Blogs are looked up from their job records server-side, so a user's full
+    history is available even after a frontend reload or backend restart.
+    """
+    blogs = []
+    for record in JOB_MANAGER.list_blogs(user_id):
+        title = extract_blog_title(record)
+        blogs.append(
+            BlogSummary(
+                job_id=record["job_id"],
+                topic=record.get("topic", ""),
+                title=title,
+                created_at=record.get("created_at"),
+                updated_at=record.get("updated_at"),
+            )
+        )
+    return BlogListResponse(blogs=blogs)
+
+
+def extract_blog_title(record: dict) -> str:
+    """Best-effort title from the plan JSON, falling back to the first # heading."""
+    plan = record.get("plan")
+    if isinstance(plan, dict) and plan.get("blog_title"):
+        return plan["blog_title"]
+    content = record.get("content") or ""
+    for line in content.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return record.get("topic", "")[:80]
+
+
 @router.get("/metrics")
 def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -137,7 +173,7 @@ def health():
         "redis_configured": bool(secrets.redis_url),
         "redis_ready": redis_ready,
         "jobs_executor": JOB_MANAGER.default_execution_mode,
-        "images_enabled": bool(secrets.google_api_key),
+        "images_enabled": bool(secrets.pollinations_api_key),
         "langsmith_tracing": project is not None,
         "langsmith_project": project,
         "langsmith_auth": state if state == "ok" else (auth_detail or state),

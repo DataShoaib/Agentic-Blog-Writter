@@ -46,3 +46,17 @@ class GenerateResponse(BaseModel):
     stage: str | None = None
     plan: dict | None = None
     evidence: list[dict] = Field(default_factory=list)
+
+
+class BlogSummary(BaseModel):
+    """A lightweight reference to one completed blog in a user's history."""
+
+    job_id: str
+    topic: str
+    title: str
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class BlogListResponse(BaseModel):
+    blogs: list[BlogSummary]
