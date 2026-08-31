@@ -5,7 +5,6 @@ from typing import Optional
 
 from app.config import APP_CONFIG, get_secrets
 from app.graph.schemas import EvidenceItem
-from app.services.cache import cache_key, get_redis_store
 
 
 class TransientSearchError(Exception):
@@ -32,19 +31,16 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
 
 
 def search_web(query: str, max_results: int = 6) -> list[EvidenceItem]:
-    """Search Tavily and cache normalized results briefly to reduce duplicate spend/latency."""
+    """Search Tavily and return normalized EvidenceItem objects.
+
+    No per-query result caching is done here: whole-blog caching lives at the
+    job layer instead (see app.services.blog_cache).
+    """
     secrets = get_secrets()
     if not secrets.tavily_api_key:
         return []
 
     max_results = max(1, min(max_results, APP_CONFIG.max_research_results))
-    key = cache_key("search", f"{query}|{max_results}")
-    cached = get_redis_store().get_json(key)
-    if isinstance(cached, list):
-        try:
-            return [EvidenceItem(**item) for item in cached]
-        except Exception:
-            pass
 
     try:
         from tavily import TavilyClient
@@ -74,12 +70,6 @@ def search_web(query: str, max_results: int = 6) -> list[EvidenceItem]:
                 source=row.get("source") or None,
             )
         )
-
-    get_redis_store().set_json(
-        key,
-        [item.model_dump() for item in evidence],
-        APP_CONFIG.cache_ttl_seconds,
-    )
     return evidence
 
 
