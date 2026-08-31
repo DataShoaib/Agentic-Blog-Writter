@@ -3,9 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
-outputs/*.md
-outputs/*.sqlite3
-outputs/*.log
-images/*.png
-!.gitkeep
+outputs/
+images/
+*.log
+!images/.gitkeep
 .DS_Store
