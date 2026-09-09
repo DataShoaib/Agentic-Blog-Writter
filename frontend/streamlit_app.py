@@ -14,7 +14,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
 IMAGES_DIR = Path("images")
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 
-st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✦", layout="wide")
+st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✨", layout="wide")
 
 THEME_CSS = """
 <style>
@@ -108,6 +108,21 @@ MORE_CSS = """
 .meta-chip {
     display: inline-block; background: #eef0f9; color: #4d566f !important;
     border-radius: 999px; padding: .18rem .65rem; font-size: .74rem; font-weight: 600; margin-right: .4rem;
+}
+
+/* ---------- auth card: wider + roomier ---------- */
+[data-testid="stVerticalBlockBorderWrapper"] > div:has(.auth-badge) {
+    padding: 2.2rem 2.6rem 2rem !important;
+}
+.auth-form-row { min-height: 3.1rem; }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-badge) [data-testid="stTextInput"] input {
+    padding: .78rem 1rem !important; font-size: .95rem !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-badge) [data-testid="stBaseButton-primary"] {
+    min-height: 2.7rem; font-size: .95rem !important; font-weight: 700 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:has(.auth-badge) [data-testid="stTabs"] [data-baseweb="tab"] {
+    font-size: .95rem !important; padding: .42rem 1.3rem !important;
 }
 
 /* ---------- inputs ---------- */
@@ -343,7 +358,7 @@ def login_panel() -> None:
 
 def auth_screen() -> None:
     """Modern centered auth card (Claude/Notion style)."""
-    _, mid, _ = st.columns([1.1, 1, 1.1], gap="large")
+    _, mid, _ = st.columns([1, 1.9, 1], gap="large")
     with mid:
         with st.container(border=True):
             st.markdown('<div class="auth-badge">✦</div>', unsafe_allow_html=True)
@@ -613,7 +628,7 @@ def article_view() -> None:
 # App flow
 # -----------------------------
 if st.session_state.pop("signup_done", False):
-    st.toast("Welcome! Your account is ready — you're signed in.", icon="✦")
+    st.toast("Welcome! Your account is ready — you're signed in.", icon="✨")
 
 try:
     health_response = api_request("GET", "/api/v1/health")
