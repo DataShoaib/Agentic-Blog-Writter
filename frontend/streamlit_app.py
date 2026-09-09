@@ -11,15 +11,10 @@ import requests
 import streamlit as st
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
 OUTPUTS_DIR = Path("outputs")
 IMAGES_DIR = Path("images")
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
-# Polling budget mirrors APP_CONFIG.job_timeout_seconds on the backend.
-POLL_INTERVAL_SECONDS = 2
-POLL_TIMEOUT_SECONDS = 900
-POLL_MAX_ATTEMPTS = POLL_TIMEOUT_SECONDS // POLL_INTERVAL_SECONDS
-GRAPH_STAGES = ["router", "research", "planner", "worker", "merge", "quality", "revise", "images", "generate_images"]
 
 st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✦", layout="wide")
 st.markdown(
@@ -67,7 +62,22 @@ st.markdown(
 
 
 def api_request(method: str, path: str, **kwargs) -> requests.Response:
-    return requests.request(method, f"{API_BASE_URL}{path}", timeout=30, **kwargs)
+    response = requests.request(method, f"{API_BASE_URL}{path}", timeout=30, **kwargs)
+    # Auto-refresh on expired access token: swap the bearer and retry once.
+    if response.status_code == 401 and st.session_state.get("refresh_token") and path != "/api/v1/auth/refresh":
+        refresh = api_request(
+            "POST",
+            "/api/v1/auth/refresh",
+            json={"refresh_token": st.session_state["refresh_token"]},
+        )
+        if refresh.ok:
+            st.session_state.token = refresh.json()["access_token"]
+            st.session_state.refresh_token = refresh.json()["refresh_token"]
+            headers = kwargs.get("headers") or {}
+            headers["Authorization"] = f"Bearer {st.session_state.token}"
+            kwargs["headers"] = headers
+            response = requests.request(method, f"{API_BASE_URL}{path}", timeout=30, **kwargs)
+    return response
 
 
 def show_error(response: requests.Response) -> None:
@@ -135,207 +145,180 @@ def bundle_bytes(markdown: str, title: str) -> bytes:
     return buffer.getvalue()
 
 
-def load_blog(token: str, job_id: str) -> None:
-    """Load a previously generated blog into the workspace from its job record."""
-    try:
-        response = api_request(
-            "GET", f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"}
-        )
-    except requests.RequestException as exc:
-        st.error(f"Could not reach the backend: {exc}")
-        return
-    if not response.ok:
-        show_error(response)
-        return
-    job = response.json()
-    if job.get("status") != "completed":
-        st.warning(f"Blog {job_id} is not completed (status: {job.get('status')}).")
-        return
-    st.session_state.last_content = job.get("content", "")
-    st.session_state.last_job_id = job_id
-    st.session_state.last_plan = job.get("plan")
-    st.session_state.last_evidence = job.get("evidence", [])
-    st.session_state.last_stage = job.get("stage", "completed")
-    st.session_state.last_created_at = job.get("created_at")
-    st.session_state.last_updated_at = job.get("updated_at")
-    st.session_state.last_executor = "cached"
-    st.rerun()
-
-
 def signup_panel() -> None:
     with st.form("signup-form"):
         username = st.text_input("Username", placeholder="writer")
         password = st.text_input("Password", type="password", placeholder="At least 8 characters")
         submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
     if submitted:
-        try:
-            response = api_request("POST", "/api/v1/auth/signup", json={"username": username, "password": password})
-        except requests.RequestException as exc:
-            st.error(f"Could not reach the backend at {API_BASE_URL}: {exc}")
+        username = (username or "").strip()
+        password = password or ""
+        if len(password) < 8:
+            st.error("❌ Password must be at least 8 characters. You entered " + str(len(password)) + ".")
             return
-        if response.ok:
-            st.success("Account created. Open Login to continue.")
-        else:
+        if not re.match(r"^[A-Za-z0-9_.-]+$", username):
+            st.error("❌ Username may only contain letters, numbers, dots, dashes and underscores (no spaces or @).")
+            return
+        response = api_request(
+            "POST", "/api/v1/auth/signup", json={"username": username, "password": password}
+        )
+        if not response.ok:
             show_error(response)
+            return
+        # Seamless: sign up then immediately log in with the same credentials.
+        login = api_request(
+            "POST",
+            "/api/v1/auth/token",
+            data={"username": username, "password": password},
+        )
+        if login.ok:
+            st.session_state.token = login.json()["access_token"]
+            st.session_state.refresh_token = login.json()["refresh_token"]
+            st.session_state.signup_done = True
+            st.rerun()
+        else:
+            st.session_state.signup_done = True
+            st.session_state.signup_success = True
+            st.session_state.new_username = username
 
 
 def login_panel() -> None:
-    with st.form("login-form"):
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+    if st.session_state.pop("signup_success", False):
+        st.success(
+            "Account created! The automatic sign-in hit a snag — please log in with the "
+            "same username and password."
+        )
+    login_username = st.text_input(
+        "Username",
+        value=st.session_state.pop("new_username", st.session_state.get("login_username", "")),
+    )
+    login_password = st.text_input(
+        "Password",
+        type="password",
+        key="login_password",
+        value=st.session_state.get("login_password", ""),
+    )
+    submitted = st.button("Log in", type="primary", use_container_width=True)
     if submitted:
-        if not username.strip() or not password.strip():
-            st.warning("Enter both a username and a password.")
-            return
-        try:
-            response = api_request("POST", "/api/v1/auth/token", data={"username": username, "password": password})
-        except requests.RequestException as exc:
-            st.error(f"Could not reach the backend at {API_BASE_URL}: {exc}")
-            return
+        login_username = (login_username or "").strip()
+        response = api_request(
+            "POST",
+            "/api/v1/auth/token",
+            data={"username": login_username, "password": login_password},
+        )
         if response.ok:
             st.session_state.token = response.json()["access_token"]
+            st.session_state.refresh_token = response.json()["refresh_token"]
+            st.session_state.pop("login_username", None)
+            st.session_state.pop("login_password", None)
             st.rerun()
         else:
+            st.session_state.login_username = login_username
             show_error(response)
 
 
 def authenticated_workspace() -> None:
     token = st.session_state.get("token")
+    if st.session_state.pop("signup_done", False):
+        st.success("Welcome! Your account is ready — you're signed in.")
     with st.sidebar:
         st.header("Generate New Blog")
         topic = st.text_area("Topic", placeholder="How should production RAG systems be evaluated?", height=120)
-        research_label = st.radio(
-            "Web research",
-            ["Auto", "Always", "Never"],
-            horizontal=True,
-            help=(
-                "Auto: the router decides (stable concepts like self-attention skip research). "
-                "Always: force web search. Never: skip research entirely."
-            ),
+        as_of = st.date_input("As-of date", value=None, help="Leave blank for today. Limits research to this date or earlier.")
+        preferred_model = st.session_state.get("_model_options")
+        model_choice = st.selectbox(
+            "Preferred model",
+            ["(fallback chain)"] + (preferred_model or []),
+            index=0,
+            help="Primary LLM for drafting/review. The fallback chain kicks in on quota errors.",
         )
-        st.session_state["research_mode"] = {"Auto": "auto", "Always": "force", "Never": "skip"}[research_label]
         submitted = st.button("Generate Blog", type="primary", use_container_width=True)
         st.divider()
 
-        # Per-user blog history: every blog this user generated, selectable.
         st.subheader("My past blogs")
         try:
-            resp = api_request(
-                "GET", "/api/v1/blogs", headers={"Authorization": f"Bearer {token}"}
-            )
-        except requests.RequestException:
-            resp = None
-        if resp is not None and resp.ok:
-            blogs = resp.json().get("blogs", [])
-            if not blogs:
-                st.caption("No blogs generated yet.")
-            else:
-                labels = [
-                    f"{b['title']}  ·  {b['job_id'][:8]}" for b in blogs
-                ]
-                chosen = st.radio(
-                    "Select a blog to reload",
-                    labels,
-                    key="past_blog_radio",
-                    label_visibility="collapsed",
-                )
-                if st.button("Load selected blog", use_container_width=True):
-                    index = labels.index(chosen)
-                    load_blog(token, blogs[index]["job_id"])
+            history = api_request("GET", "/api/v1/blogs", headers={"Authorization": f"Bearer {token}"})
+            blogs = history.json().get("blogs", []) if history.ok else []
+        except Exception:
+            blogs = []
+        if not blogs:
+            st.caption("No blogs generated yet.")
         else:
-            st.caption("Could not load blog history.")
+            labels = [f"{blog['title']} · {blog['created_at'][:10]}" for blog in blogs]
+            choice = st.selectbox("Select a blog", labels, label_visibility="collapsed")
+            if st.button("Load selected blog", use_container_width=True):
+                selected = blogs[labels.index(choice)]
+                result = api_request(
+                    "GET",
+                    f"/api/v1/jobs/{selected['job_id']}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if result.ok:
+                    job = result.json()
+                    st.session_state.last_content = job.get("content", "")
+                    st.session_state.last_job_id = selected["job_id"]
+                    st.session_state.last_plan = job.get("plan")
+                    st.session_state.last_evidence = job.get("evidence", [])
+                    st.rerun()
+                else:
+                    show_error(result)
 
         st.divider()
         if st.button("Log out", use_container_width=True):
-            st.session_state.pop("token", None)
+            for key in ("token", "refresh_token", "last_content", "last_job_id", "last_plan", "last_evidence", "last_timestamps"):
+                st.session_state.pop(key, None)
             st.rerun()
 
     if submitted:
         if not topic.strip():
             st.warning("Please enter a topic.")
             return
-        try:
-            response = api_request(
-                "POST",
-                "/api/v1/generate",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "topic": topic.strip(),
-                    "research_mode": st.session_state.get("research_mode", "auto"),
-                },
-            )
-        except requests.RequestException as exc:
-            st.error(f"Could not reach the backend at {API_BASE_URL}: {exc}")
-            return
+        payload = {
+            "topic": topic.strip(),
+            "preferred_model": None if model_choice == "(fallback chain)" else model_choice,
+        }
+        if as_of is not None:
+            payload["as_of"] = as_of.isoformat()
+        response = api_request("POST", "/api/v1/generate", headers={"Authorization": f"Bearer {token}"}, json=payload)
         if not response.ok:
             show_error(response)
             return
         job_id = response.json()["job_id"]
-        executor = health.get("jobs_executor", "unknown") if health else "unknown"
-        progress = st.progress(0, text=f"Job queued on the {executor} executor...")
+        progress = st.progress(0, text="Starting workflow...")
         status_box = st.status("Running graph...", expanded=True)
-        status_box.write(f"Job ID: `{job_id}` | Executor: `{executor}`")
-        shown_stage: str | None = None
-        started_at = time.time()
-        poll_errors = 0
-        for attempt in range(POLL_MAX_ATTEMPTS):
-            time.sleep(POLL_INTERVAL_SECONDS)
-            elapsed = int(time.time() - started_at)
-            try:
-                result = api_request(
-                    "GET",
-                    f"/api/v1/jobs/{job_id}",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-            except requests.RequestException as exc:
-                poll_errors += 1
-                if poll_errors >= 5:
-                    progress.empty()
-                    status_box.update(label="Lost connection to the backend", state="error", expanded=True)
-                    st.error(f"Stopped polling job `{job_id}` after repeated network errors: {exc}")
-                    return
-                status_box.write(f"Polling hiccup ({poll_errors}/5): {exc}")
-                continue
+        stages = ["router", "research", "planner", "workers", "quality gate", "images"]
+        shown_stages: set[str] = set()
+        for attempt in range(60):
+            time.sleep(2)
+            result = api_request("GET", f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"})
             if not result.ok:
                 progress.empty()
                 show_error(result)
                 return
-            poll_errors = 0
             job = result.json()
-            stage = job.get("stage") or job["status"]
-            if stage != shown_stage:
-                status_box.write(f"Stage: `{stage}` — {elapsed}s elapsed")
-                shown_stage = stage
-            progress.progress(
-                min(95, elapsed * 95 // POLL_TIMEOUT_SECONDS),
-                text=f"Status: {job['status']} | Stage: {stage} | {elapsed}s elapsed",
-            )
             if job["status"] == "completed":
                 st.session_state.last_content = job.get("content", "")
                 st.session_state.last_job_id = job_id
                 st.session_state.last_plan = job.get("plan")
                 st.session_state.last_evidence = job.get("evidence", [])
-                st.session_state.last_stage = stage
-                st.session_state.last_created_at = job.get("created_at")
-                st.session_state.last_updated_at = job.get("updated_at")
-                st.session_state.last_elapsed_seconds = elapsed
-                st.session_state.last_executor = executor
-                progress.progress(100, text=f"Article ready in {elapsed}s")
+                st.session_state.last_timestamps = (job.get("created_at"), job.get("updated_at"))
+                progress.progress(100, text="Article ready")
                 status_box.update(label="Done", state="complete", expanded=False)
                 break
             if job["status"] == "failed":
                 progress.empty()
-                status_box.update(label=f"Generation failed at stage `{stage}`", state="error", expanded=True)
+                status_box.update(label="Generation failed", state="error", expanded=True)
                 st.error(job.get("error") or "Article generation failed.")
-                st.caption(f"Job ID for server logs: `{job_id}` | Executor: `{executor}`")
                 return
+            # Real workflow stage reported by the backend (falls back to a heuristic).
+            stage = job.get("stage") or stages[min(len(stages) - 1, attempt // 10)]
+            if stage not in shown_stages:
+                status_box.write(f"Stage: `{stage}`")
+                shown_stages.add(stage)
+            progress.progress(min(95, (attempt + 1) * 95 // 60), text=f"Job status: {job['status']} | {stage}")
         else:
             progress.empty()
-            st.warning(
-                f"The job is still running after {POLL_TIMEOUT_SECONDS}s. "
-                f"It keeps executing on the server; check back later. Job ID: `{job_id}`"
-            )
+            st.warning(f"The job is still running. Job ID: {job_id}")
 
     markdown = st.session_state.get("last_content", "")
     if not markdown:
@@ -410,16 +393,11 @@ def authenticated_workspace() -> None:
     with logs_tab:
         st.subheader("Logs")
         st.code(
-            f"API: {API_BASE_URL}\n"
-            f"Job: {st.session_state.get('last_job_id')}\n"
-            f"Executor: {st.session_state.get('last_executor', 'unknown')}\n"
-            f"Final stage: {st.session_state.get('last_stage', 'completed')}\n"
-            f"Created at: {st.session_state.get('last_created_at', 'n/a')}\n"
-            f"Updated at: {st.session_state.get('last_updated_at', 'n/a')}\n"
-            f"Wall time: {st.session_state.get('last_elapsed_seconds', '?')}s\n"
-            f"LangSmith project: {health.get('langsmith_project') if health and health.get('langsmith_tracing') else 'tracing off'}\n"
-            f"Evidence found: {len(st.session_state.get('last_evidence') or extract_evidence(markdown))}\n"
-            f"Images found: {len(IMAGE_RE.findall(markdown))}"
+            f"API: {API_BASE_URL}\nJob: {st.session_state.get('last_job_id')}\n"
+            f"Status: completed\nEvidence found: {len(st.session_state.get('last_evidence') or extract_evidence(markdown))}\n"
+            f"Images found: {len(IMAGE_RE.findall(markdown))}\n"
+            f"Created: {st.session_state.get('last_timestamps', (None, None))[0]}\n"
+            f"Updated: {st.session_state.get('last_timestamps', (None, None))[1]}"
         )
 
 
@@ -430,20 +408,24 @@ try:
 except requests.RequestException:
     health = None
 
+# Fetch available LLM candidates once per session for the model picker.
+if "_model_options" not in st.session_state:
+    try:
+        models_response = api_request("GET", "/api/v1/models")
+        st.session_state._model_options = models_response.json().get("models", []) if models_response.ok else []
+    except requests.RequestException:
+        st.session_state._model_options = []
+
 with st.sidebar:
     st.subheader("Connection")
     st.code(API_BASE_URL)
     if health:
         st.success("Backend online")
-        st.caption(f"Images enabled: {health.get('images_enabled', False)}")
+        st.caption(f"JWT configured: {health.get('jwt_configured', False)}")
         st.caption(f"Redis ready: {health.get('redis_ready', False)}")
-        st.caption(f"Jobs executor: {health.get('jobs_executor', 'unknown')}")
-        if health.get("langsmith_tracing"):
-            st.caption(f"LangSmith: {health.get('langsmith_project')}")
-        elif str(health.get("langsmith_auth", "")).startswith("LangSmithAuthError") or "401" in str(health.get("langsmith_auth", "")) or "Invalid token" in str(health.get("langsmith_auth", "")):
-            st.error("LangSmith key invalid - traces NOT uploading. Fix LANGSMITH_API_KEY in .env and restart.")
-        else:
-            st.caption("LangSmith tracing: off")
+        st.caption(f"Images enabled: {health.get('images_enabled', False)}")
+        if st.session_state._model_options:
+            st.caption(f"Models: {', '.join(st.session_state._model_options[:2])}")
     else:
         st.error("Backend offline")
 
