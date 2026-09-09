@@ -1,373 +1,332 @@
-"""Centralized LLM gateway built on LiteLLM.
-
-All chat traffic flows through :func:`invoke_text` and :func:`invoke_structured`.
-LiteLLM normalizes the provider API surface, so the gateway only adds what the
-application actually needs: model fallback, transient retries, token-usage
-accounting, and Prometheus metrics.
-"""
-
 from __future__ import annotations
-
-import json
 import logging
-import random
 import re
 import time
-from typing import Any, TypeVar
+from typing import Any
 
-from litellm import completion as _litellm_completion
-from pydantic import BaseModel
+from litellm import Router
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from app.config import APP_CONFIG, get_secrets
-from app.observability.metrics import (
-    LLM_CALLS,
-    LLM_FAILURES,
-    LLM_MODEL_FALLBACKS,
-    LLM_RETRIES,
-)
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+TEXT_OUTPUT_TOKENS, STRUCTURED_OUTPUT_TOKENS = 1300, 3400
 
-RATE_LIMIT_RETRY_SECONDS = 12
-RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-TEXT_OUTPUT_TOKENS = 1300
-STRUCTURED_OUTPUT_TOKENS = 3400
+# Structured output is the only sanctioned way to get data out of the LLM:
+# every caller passes a pydantic schema (or plain dict) and receives a
+# validated instance back. No other module parses raw LLM JSON.
+StructuredSchema = type[BaseModel] | type[dict]
 
-# Module-level seam so tests can stub the transport without patching litellm.
-_completion = _litellm_completion
-
-# Per-call token usage, reported by the evaluation runner.
-_TOKEN_USAGE: list[dict] = []
+# Defensive recovery for providers that ignore `response_format` and wrap the
+# JSON payload in prose or markdown fences. The normal path is native
+# structured output; this only rescues contract-violating completions.
+_JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```$")
 
 
 class LLMGatewayError(RuntimeError):
-    """Raised when every configured model and retry attempt has been exhausted."""
+    """Raised when the LLM Router cannot complete a request."""
 
 
-class _EmptyContentError(RuntimeError):
-    """The model answered but produced no usable text; retry/fallback applies."""
+_QUOTA_HINTS = ("quota", "rate limit", "429", "tpm", "rpm", "requests per day", "resource exhausted")
 
 
-def model_candidates() -> list[str]:
-    """Ordered litellm model names: primary first, then configured fallbacks.
-
-    Configured names (e.g. "openai/gpt-oss-20b", "qwen/qwen3.6-27b") are Groq
-    model ids, not litellm provider routes — they are all routed through the
-    ``groq/`` provider so litellm talks to the Groq API with GROQ_API_KEY.
-    """
-    secrets = get_secrets()
-    primary = secrets.groq_model or APP_CONFIG.groq_model
-    overrides = [
-        name.strip()
-        for name in getattr(secrets, "groq_fallback_models", "").split(",")
-        if name.strip()
-    ]
-    names = [primary, *(overrides or list(APP_CONFIG.llm_fallback_models))]
-
-    candidates: list[str] = []
-    for name in names:
-        if not name:
-            continue
-        routed = name if name.startswith("groq/") else f"groq/{name}"
-        if routed not in candidates:
-            candidates.append(routed)
-
-    if not candidates:
-        raise RuntimeError("No LLM model is configured.")
-    return candidates
+def _is_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(hint in message for hint in _QUOTA_HINTS)
 
 
-def _ordered_candidates(preferred_model: str | None) -> list[str]:
-    """Fallback order starting from ``preferred_model`` when it is a candidate.
-
-    Keeps the same overall fallback chain but lets callers (e.g. parallel
-    section workers) start on different models so bursts spread across
-    separate provider rate-limit buckets instead of hammering one pool.
-    """
-    base = model_candidates()
-    if preferred_model and preferred_model in base:
-        index = base.index(preferred_model)
-        return base[index:] + base[:index]
-    return base
-
-
-def _to_litellm_messages(messages: list[Any]) -> list[dict[str, str]]:
-    """Accept langchain BaseMessage objects or plain {role, content} dicts."""
-    role_map = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
-    converted: list[dict[str, str]] = []
-    for message in messages:
-        if isinstance(message, dict):
-            converted.append({"role": message.get("role", "user"), "content": message.get("content", "")})
-            continue
-        role = getattr(message, "type", None) or "user"
-        converted.append({"role": role_map.get(role, role), "content": str(getattr(message, "content", ""))})
-    return converted
-
-def _status_code(exc: Exception) -> int | None:
-    status_code = getattr(exc, "status_code", None)
-    response = getattr(exc, "response", None)
-    if status_code is None and response is not None:
-        status_code = getattr(response, "status_code", None)
-    return status_code
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    return _status_code(exc) == 429 or "rate_limit" in str(exc).lower()
-
-
-def _is_json_generation_error(exc: Exception) -> bool:
-    """Provider-side failures where the model emitted invalid JSON."""
-    text = str(exc).lower()
-    return (
-        "json_validate_failed" in text
-        or "failed to generate json" in text
-        or "failed to validate json" in text
-        or "does not support response format" in text
+def _friendly_gateway_error(operation: str, candidates: list[str], exc: Exception) -> LLMGatewayError:
+    """Translate a raw LLM failure into a user-actionable message."""
+    if _is_quota_error(exc):
+        return LLMGatewayError(
+            f"LLM quota/rate limit reached for '{operation}' on all tried models ({', '.join(candidates)}). "
+            "The Gemini free tier allows only ~20 requests/day per model. Either wait for the daily reset, "
+            "add/replace the GEMINI_API_KEY in the .env file, or upgrade the key to Pay-as-you-go in "
+            "Google AI Studio."
+        )
+    return LLMGatewayError(
+        f"LLM operation '{operation}' failed after trying {candidates}."
     )
 
 
-def _is_transient_error(exc: Exception) -> bool:
-    # Empty generations are stochastic: a retry (or fallback model) frequently
-    # succeeds, so they must not be treated as permanent faults.
-    if isinstance(exc, _EmptyContentError):
-        return True
-    if _is_rate_limit_error(exc) or _status_code(exc) in RETRYABLE_STATUS_CODES:
-        return True
-    # Invalid-JSON generations are stochastic: a retry (or fallback model)
-    # frequently succeeds, so they must not be treated as permanent faults.
-    if _status_code(exc) == 400 and _is_json_generation_error(exc):
-        return True
-    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+def model_candidates() -> list[str]:
+    secrets = get_secrets()
+    primary = getattr(secrets, "llm_model", None) or APP_CONFIG.llm_model
+    fallbacks = getattr(secrets, "llm_fallback_models", None) or APP_CONFIG.llm_fallback_models
+    models = [model for model in dict.fromkeys([primary, *fallbacks]) if model]
+
+    if not models:
+        raise RuntimeError("No LLM model is configured.")
+    return models
 
 
-def _retry_delay(exc: Exception) -> float:
-    match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", str(exc), re.IGNORECASE)
-    return min(max(float(match.group(1)) if match else RATE_LIMIT_RETRY_SECONDS, 1), 30)
+def _build_router() -> Router:
+    secrets = get_secrets()
+    return Router(
+        model_list=[
+            {
+                "model_name": model,
+                "litellm_params": {
+                    "model": model,
+                    "api_key": secrets.gemini_api_key,
+                    "timeout": APP_CONFIG.request_timeout_seconds,
+                },
+            }
+            for model in model_candidates()
+        ],
+        num_retries=2,
+        # Failed models cool down briefly so the router moves on to the next
+        # candidate instead of hammering the same exhausted quota.
+        cooldown_time=30,
+        allowed_fails=3,
+    )
 
 
-def _backoff_delay(attempt: int) -> float:
-    """Exponential backoff with jitter, capped by configuration."""
-    delay = APP_CONFIG.llm_retry_backoff_seconds * (2 ** max(attempt - 1, 0))
-    return min(delay * random.uniform(0.8, 1.2), APP_CONFIG.llm_retry_backoff_cap_seconds)
+_router: Router | None = None
 
 
-def _record_token_usage(response: Any) -> None:
+def _get_router() -> Router:
+    global _router
+    if _router is None:
+        _router = _build_router()
+    return _router
+
+
+_TOKEN_USAGE: list[dict[str, Any]] = []
+
+
+def _record_usage(response: Any) -> None:
     usage = getattr(response, "usage", None)
-    if not usage:
-        return
-    prompt = getattr(usage, "prompt_tokens", 0) or 0
-    completion = getattr(usage, "completion_tokens", 0) or 0
-    if not prompt and not completion:
-        return
-    _TOKEN_USAGE.append({
-        "model": getattr(response, "model", "") or "",
-        "prompt_tokens": int(prompt),
-        "completion_tokens": int(completion),
-    })
+    if usage:
+        _TOKEN_USAGE.append({"model": getattr(response, "model", "unknown"), "prompt_tokens": getattr(usage, "prompt_tokens", 0), "completion_tokens": getattr(usage, "completion_tokens", 0)})
 
 
-def get_recorded_token_usage() -> list[dict]:
-    """Token usage per call, consumed by the evaluation runner's cost report."""
-    return [dict(entry) for entry in _TOKEN_USAGE]
+def _to_messages(messages: list[Any]) -> list[dict[str, str]]:
+    roles = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+    return [{"role": str(message.get("role", "user")), "content": str(message.get("content", ""))} if isinstance(message, dict) else {"role": roles.get(getattr(message, "type", "user"), "user"), "content": str(message.content)} for message in messages]
 
 
-def _estimate_input_tokens(messages: list[dict[str, str]]) -> int:
-    """Count input tokens, falling back to a chars/4 estimate if the
-    tokenizer is unavailable (keeps the gateway dependency-light)."""
-    try:
-        from litellm import token_counter
-        count = token_counter(messages=messages)
-        if isinstance(count, (int, float)) and count > 0:
-            return int(count)
-    except Exception:
-        pass
-    return sum(len(m.get("content", "")) for m in messages) // 4
+def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model: str | None = None, max_tokens: int, response_format: type[BaseModel] | None = None) -> Any:
+    candidates = model_candidates()
+
+    # Ordered try-list: the user's preferred model first, then every other
+    # candidate. This guarantees a real failover chain — requesting an exact
+    # provider route from litellm's Router does NOT fall back on its own.
+    if preferred_model and preferred_model in candidates:
+        ordered = [preferred_model, *(model for model in candidates if model != preferred_model)]
+    else:
+        ordered = list(candidates)
+
+    last_exc: Exception | None = None
+    for index, model in enumerate(ordered):
+        kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
+        if response_format:
+            kwargs["response_format"] = response_format
+        try:
+            response = _get_router().completion(**kwargs)
+            _record_usage(response)
+            return response
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "LLM model %s failed for operation=%s: %s", model, operation, str(exc)[:300]
+            )
+            # A candidate remains: pause briefly before handing over, honouring
+            # the provider's suggested backoff for quota/rate-limit failures.
+            if index < len(ordered) - 1:
+                if _is_quota_error(exc):
+                    wait = float(getattr(exc, "retry_delay_seconds", 0) or 2.0)
+                    time.sleep(min(wait, 3.0))
+                else:
+                    time.sleep(1.0)
+
+    assert last_exc is not None
+    raise _friendly_gateway_error(operation, candidates, last_exc) from last_exc
 
 
-def _output_budget(messages: list[dict[str, str]], desired_output_tokens: int) -> int:
-    """Shrink the output cap so input+output fits one free-tier TPM window.
+def _content(response: Any) -> str:
+    return (response.choices[0].message.content or "").strip()
 
-    Groq returns 413 when a single request exceeds the TPM window, which on
-    the free tier is small. Keep the request under ``llm_request_token_budget``
-    but never shrink below a workable minimum.
+
+def _json_payload(content: str) -> str:
+    """Extract the embedded JSON object/array from a prose-wrapped completion.
+
+    Used only when a provider violates the response_format contract (e.g.
+    wraps the payload in "Here is the answer: ```json ... ```").
     """
-    remaining = APP_CONFIG.llm_request_token_budget - _estimate_input_tokens(messages)
-    return max(256, min(desired_output_tokens, remaining, APP_CONFIG.llm_max_output_tokens))
-
-
-def _call(
-    model: str,
-    messages: list[dict[str, str]],
-    *,
-    max_tokens: int,
-    response_format: type[BaseModel] | None = None,
-) -> Any:
-    """Single litellm.completion attempt."""
-    api_key = get_secrets().groq_api_key
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "api_key": api_key,
-        "num_retries": 0,  # the gateway owns the retry policy
-        "timeout": APP_CONFIG.request_timeout_seconds,
-    }
-    if response_format is not None:
-        kwargs["response_format"] = response_format
-    return _completion(**kwargs)
-
-
-def _response_text(response: Any) -> str:
-    """Extract plain text from a litellm completion response."""
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError):
-        return ""
-    return content.strip() if isinstance(content, str) else ""
-
-
-def _extract_json(text: str) -> str:
-    """Best-effort extraction of a JSON object/array from model text."""
-    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = _JSON_FENCE_RE.sub("", text).strip()
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
     if not starts:
         return text
-    return text[min(starts):]
+    start = min(starts)
+    closer = "}" if text[start] == "{" else "]"
+    end = text.rfind(closer)
+    return text[start : end + 1] if end > start else text
+
+_A_STRING_OPENERS = frozenset("{[,:=(")
 
 
-def _invoke(
-    messages: list[Any],
-    *,
-    operation: str,
-    preferred_model: str | None,
-    max_tokens: int,
-    response_format: type[BaseModel] | None = None,
-) -> str:
-    """Retry/fallback core shared by invoke_text and invoke_structured."""
-    secrets = get_secrets()
-    if not secrets.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
+def _looks_like_string_start(text: str, i: int) -> bool:
+    """Heuristic: is a single-quote at ``i`` a JSON string delimiter?
 
-    converted = _to_litellm_messages(messages)
-    max_tokens = _output_budget(converted, max_tokens)
-    candidates = _ordered_candidates(preferred_model)
-    max_attempts = max(1, APP_CONFIG.llm_max_attempts_per_model)
-    last_exc: Exception | None = None
-
-    for index, model in enumerate(candidates):
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = _call(
-                    model, converted, max_tokens=max_tokens, response_format=response_format
-                )
-                _record_token_usage(response)
-                text = _response_text(response)
-                if not text:
-                    raise _EmptyContentError(
-                        f"LLM returned empty content for operation '{operation}'."
-                    )
-                logger.info(
-                    "llm operation=%s succeeded with model=%s on attempt %d",
-                    operation, model, attempt,
-                )
-                return text
-            except Exception as exc:
-                last_exc = exc
-                if not _is_transient_error(exc):
-                    logger.warning(
-                        "llm operation=%s model=%s permanent %s; moving to next model",
-                        operation, model, type(exc).__name__,
-                    )
-                    break  # stop burning retries on this model; try the next one
-                if attempt < max_attempts:
-                    delay = (
-                        _retry_delay(exc)
-                        if _is_rate_limit_error(exc)
-                        else _backoff_delay(attempt)
-                    )
-                    LLM_RETRIES.labels(operation=operation).inc()
-                    logger.warning(
-                        "llm operation=%s model=%s transient %s on attempt %d/%d; "
-                        "retrying in %.2fs",
-                        operation, model, type(exc).__name__, attempt, max_attempts, delay,
-                    )
-                    time.sleep(delay)
-
-        if index < len(candidates) - 1:
-            LLM_MODEL_FALLBACKS.labels(operation=operation).inc()
-            logger.warning(
-                "llm operation=%s exhausted model=%s; falling back to %s",
-                operation, model, candidates[index + 1],
-            )
-
-    raise LLMGatewayError(
-        f"LLM operation '{operation}' failed after trying models {candidates}."
-    ) from last_exc
+    True when, ignoring whitespace, the previous char is an opener of a key or
+    value position (``{ [ , : =`` or start of input) AND the next non-whitespace
+    char is actual string content rather than an immediate closing delimiter.
+    """
+    j = i - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j >= 0 and text[j] not in _A_STRING_OPENERS:
+        return False
+    k = i + 1
+    while k < len(text) and text[k] in " \t\r\n":
+        k += 1
+    if k >= len(text) or text[k] in "},]":
+        return False
+    return True
 
 
-def invoke_text(
-    messages: list[Any],
-    *,
-    operation: str,
-    preferred_model: str | None = None,
-) -> str:
-    """Generate free-form text; retries transient errors, falls back models."""
-    LLM_CALLS.labels(operation=operation).inc()
-    try:
-        return _invoke(
-            messages,
-            operation=operation,
-            preferred_model=preferred_model,
-            max_tokens=TEXT_OUTPUT_TOKENS,
-        )
-    except Exception as exc:
-        LLM_FAILURES.labels(operation=operation).inc()
-        logger.error("llm operation=%s failed permanently: %s", operation, exc)
-        raise
+def _repair_json(text: str) -> str:
+    """Best-effort repair of LLM-emitted JSON.
+
+    Handles the most common ways LLMs violate the JSON contract:
+      * literal newlines/tabs/carriage returns inside string values,
+      * stray unescaped double-quotes inside double-quoted string values,
+      * single-quoted strings (converted to double-quoted delimiters),
+      * missing or mismatched closing brackets (e.g. an unclosed array).
+
+    Pydantic validation still runs after this, so anything still invalid is
+    rejected before use; this only ever returns a *better-approximating* string.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    delim = ""
+    stack = []
+    while i < n:
+        ch = text[i]
+        if in_str:
+            nxt = text[i + 1] if i + 1 < n else ""
+            if ch == "\\" and nxt:
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == '"' and delim == '"':
+                # Terminator or stray quote? Peek ahead: structural -> closer.
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if j < n and text[j] in ":,]}":
+                    out.append('"')
+                    in_str = False
+                    delim = ""
+                else:
+                    out.append('\\"')
+                i += 1
+                continue
+            if ch == delim:
+                out.append('"')
+                in_str = False
+                delim = ""
+                i += 1
+                continue
+            if ch in ("\r", "\n", "\t"):
+                out.append({"\r": "\\r", "\n": "\\n", "\t": "\\t"}[ch])
+                i += 1
+                continue
+            if ch == '"' and delim == "'":
+                out.append('\\"')
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            out.append(ch)
+        elif ch in "}]":
+            want = "{" if ch == "}" else "["
+            if stack and stack[-1] != want:
+                # Mismatched closer (e.g. "}" while an array is still open):
+                # close the open bracket first so the current one lands right.
+                opened = stack.pop()
+                out.append("]" if opened == "[" else "}")
+            if stack and stack[-1] == want:
+                stack.pop()
+            out.append(ch)
+        elif ch == '"':
+            in_str = True
+            delim = '"'
+            out.append('"')
+        elif ch == "'" and _looks_like_string_start(text, i):
+            in_str = True
+            delim = "'"
+            out.append('"')
+        else:
+            out.append(ch)
+        i += 1
+    if in_str:
+        out.append('"')
+    while stack:
+        opened = stack.pop()
+        out.append("]" if opened == "[" else "}")
+    return "".join(out)
+
+
+def invoke_text(messages: list[Any], *, operation: str, preferred_model: str | None = None) -> str:
+    return _content(_complete(_to_messages(messages), operation=operation, preferred_model=preferred_model, max_tokens=TEXT_OUTPUT_TOKENS))
 
 
 def invoke_structured(
-    schema: type[T],
+    schema: StructuredSchema,
     messages: list[Any],
     *,
     operation: str,
     preferred_model: str | None = None,
-) -> T:
-    """Generate a Pydantic ``schema`` instance; same retry/fallback policy."""
-    LLM_CALLS.labels(operation=operation).inc()
-    structured_messages = [
-        {"role": "system", "content": "Return only valid JSON matching the requested schema."},
-        *_to_litellm_messages(messages),
-    ]
-    try:
-        text = _invoke(
-            structured_messages,
-            operation=operation,
-            preferred_model=preferred_model,
-            max_tokens=STRUCTURED_OUTPUT_TOKENS,
-            response_format=(
-                schema
-                if isinstance(schema, type) and issubclass(schema, BaseModel)
-                else None
-            ),
-        )
-        return _parse_structured(schema, text)
-    except Exception as exc:
-        LLM_FAILURES.labels(operation=operation).inc()
-        logger.error("llm operation=%s failed permanently: %s", operation, exc)
-        raise
+) -> Any:
+    """Structured output through the gateway.
 
-
-def _parse_structured(schema: type[T], text: str) -> T:
-    """Validate model output against ``schema``, tolerating prose-wrapped JSON."""
-    if isinstance(schema, type) and issubclass(schema, BaseModel):
+    Primary contract: native provider structured output (`response_format`),
+    schema-validated on our side with a pydantic TypeAdapter. If a provider
+    violates the contract and returns prose-wrapped JSON, the payload is
+    recovered defensively before the same validation runs.
+    """
+    response_format = schema if isinstance(schema, type) and issubclass(schema, BaseModel) else None
+    response = _complete(
+        _to_messages(messages),
+        operation=operation,
+        preferred_model=preferred_model,
+        max_tokens=STRUCTURED_OUTPUT_TOKENS,
+        response_format=response_format,
+    )
+    content = _content(response)
+    adapter = TypeAdapter(schema)
+    payload = _json_payload(content)
+    # Try the raw completion, then the fence-stripped payload. If a provider
+    # violates its response_format contract and emits malformed JSON, raise
+    # LLMGatewayError so callers degrade gracefully instead of crashing the
+    # whole job on a single flaky completion.
+    for candidate in (content, payload, _repair_json(payload), _repair_json(content)):
         try:
-            return schema.model_validate_json(text)
+            return adapter.validate_json(candidate)
+        except ValidationError:
+            continue
         except Exception:
-            return schema.model_validate_json(_extract_json(text))
-    return json.loads(_extract_json(text))  # type: ignore[return-value]
+            continue
+    schema_name = getattr(schema, '__name__', 'schema')
+    msg = (
+        f"LLM operation {operation!r} returned unparseable JSON for schema"
+        f" {schema_name} ({len(content)} chars); the model ignored its"
+        f" response_format contract and JSON repair could not recover it."
+    )
+    raise LLMGatewayError(msg)
+
+
+def get_recorded_token_usage() -> list[dict[str, Any]]:
+    return [dict(usage) for usage in _TOKEN_USAGE]
+
