@@ -13,7 +13,7 @@ def test_quality_gate_builds_prompt_with_evidence(monkeypatch):
     from app.graph.nodes import quality_gate
     from app.graph.schemas import EvidenceItem, Plan, QualityResult, Task
 
-    def fake_invoke(schema, messages, *, operation):
+    def fake_invoke(schema, messages, *, operation, preferred_model=None):
         return QualityResult(
             passed=True,
             factuality_score=0.9,
@@ -54,3 +54,6 @@ def test_revision_route_is_bounded():
     assert route_quality({"quality": {"passed": False}, "revision_count": 0, "max_revision_attempts": 1}) == "revise"
     assert route_quality({"quality": {"passed": False}, "revision_count": 1, "max_revision_attempts": 1}) == "images"
     assert route_quality({"quality": {"passed": True}, "revision_count": 0, "max_revision_attempts": 1}) == "images"
+
+
+
