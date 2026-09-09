@@ -8,7 +8,12 @@ from pydantic import BaseModel, Field, field_validator
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: Literal["bearer"] = "bearer"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=10)
 
 
 class SignupRequest(BaseModel):
@@ -24,8 +29,7 @@ class SignupResponse(BaseModel):
 class GenerateRequest(BaseModel):
     topic: str = Field(min_length=5, max_length=500)
     as_of: date | None = None
-    # auto = router decides; force = always search; skip = never search.
-    research_mode: Literal["auto", "force", "skip"] = "auto"
+    preferred_model: str | None = Field(default=None, max_length=200)
 
     @field_validator("topic")
     @classmethod
@@ -49,14 +53,11 @@ class GenerateResponse(BaseModel):
 
 
 class BlogSummary(BaseModel):
-    """A lightweight reference to one completed blog in a user's history."""
-
     job_id: str
     topic: str
     title: str
     created_at: str | None = None
-    updated_at: str | None = None
 
 
 class BlogListResponse(BaseModel):
-    blogs: list[BlogSummary]
+    blogs: list[BlogSummary] = Field(default_factory=list)

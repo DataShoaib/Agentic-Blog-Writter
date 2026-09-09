@@ -61,7 +61,6 @@ def run_case(graph, case: dict) -> dict:
             {
                 "topic": query,
                 "as_of": date.today().isoformat(),
-                "research_mode": "auto",
                 "sections": [],
                 "evidence": [],
                 "revision_count": 0,
@@ -274,8 +273,8 @@ def build_aggregate(results: list[dict]) -> dict:
 def main() -> int:
     from app.services.llm import get_recorded_token_usage
 
-    if not get_secrets().groq_api_key:
-        print("GROQ_API_KEY missing -- cannot run LLM judges or the agent.")
+    if not get_secrets().gemini_api_key:
+        print("GEMINI_API_KEY missing -- cannot run LLM judges or the agent.")
         return 2
 
     cases = load_golden_cases()
@@ -285,7 +284,7 @@ def main() -> int:
     print(f"Running {len(cases)} golden evaluation cases...\n")
     results: list[dict] = []
     for index, case in enumerate(cases):
-        # Bounded retry with cool-down: Groq free-tier token budgets recover
+        # Bounded retry with cool-down: provider token budgets recover
         # over minutes, so a case that died to a gateway outage is re-run a
         # limited number of times instead of poisoning the whole aggregate.
         # The attempt count is recorded in the result for full honesty.

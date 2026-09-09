@@ -5,21 +5,25 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-
+from jwt.exceptions import InvalidTokenError
 from app.api.schemas import (
     BlogListResponse,
     BlogSummary,
     GenerateRequest,
     GenerateResponse,
+    RefreshRequest,
     SignupRequest,
     SignupResponse,
     TokenResponse,
 )
 from app.config import get_secrets
-from app.observability.metrics import AUTH_FAILURES, RATE_LIMIT_REJECTIONS
-from app.observability.tracing import active_project, auth_state, configure_langsmith
-from app.security.auth import authenticate, create_access_token, get_current_user, register_user
+from app.security.auth import (
+    authenticate,
+    decode_token,
+    get_current_user,
+    issue_token_pair,
+    register_user,
+)
 from app.services.cache import allow_request, get_redis_store
 from app.services.jobs import JobManager
 
@@ -29,7 +33,6 @@ JOB_MANAGER = JobManager()
 
 def _require_rate_limit(user_id: str) -> None:
     if not allow_request(user_id):
-        RATE_LIMIT_REJECTIONS.inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded. Please retry later.",
@@ -40,7 +43,6 @@ def _require_rate_limit(user_id: str) -> None:
 @router.post("/auth/signup", response_model=SignupResponse, status_code=201)
 def signup(req: SignupRequest):
     if not allow_request(f"signup:{req.username}"):
-        RATE_LIMIT_REJECTIONS.inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many signup attempts. Please retry later.",
@@ -54,27 +56,48 @@ def signup(req: SignupRequest):
 @router.post("/auth/token", response_model=TokenResponse)
 def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
     if not allow_request(f"login:{form.username}"):
-        RATE_LIMIT_REJECTIONS.inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many authentication attempts. Please retry later.",
             headers={"Retry-After": "60"},
         )
-    if not authenticate(form.username, form.password):
-        AUTH_FAILURES.inc()
+    user = authenticate(form.username, form.password)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        access_token = create_access_token(form.username)
+        access_token, refresh_token = issue_token_pair(str(user["id"]))
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authentication is not configured on the server.",
         ) from exc
-    return TokenResponse(access_token=access_token)
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+
+
+@router.post("/auth/refresh", response_model=TokenResponse)
+def refresh(req: RefreshRequest):
+    """Exchange a valid refresh token for a fresh (access, refresh) pair."""
+    try:
+        subject = decode_token(req.refresh_token, expected_type="refresh")
+    except InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    _require_rate_limit(f"refresh:{subject}")
+    try:
+        access_token, refresh_token = issue_token_pair(subject)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is not configured on the server.",
+        ) from exc
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
@@ -85,11 +108,16 @@ def generate(
     _require_rate_limit(user_id)
     as_of = (req.as_of or date.today()).isoformat()
     try:
-        job_id = JOB_MANAGER.submit(user_id, req.topic, as_of, req.research_mode)
+        job_id = JOB_MANAGER.submit(
+            user_id,
+            req.topic,
+            as_of,
+            preferred_model=req.preferred_model,
+        )
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Background job service is unavailable.",
+            detail=str(exc) or "Background job service is unavailable.",
         ) from exc
     return GenerateResponse(job_id=job_id, status="queued")
 
@@ -109,7 +137,9 @@ def job(
         error=record.get("error"),
         stage=record.get("stage"),
         plan=record.get("plan"),
-        evidence=record.get("evidence", []),
+        # evidence_json is NULL for queued/running jobs; the schema only
+        # accepts a list, so coerce None to [] here.
+        evidence=record.get("evidence") or [],
         created_at=record.get("created_at"),
         updated_at=record.get("updated_at"),
     )
@@ -117,64 +147,33 @@ def job(
 
 @router.get("/blogs", response_model=BlogListResponse)
 def list_blogs(user_id: Annotated[str, Depends(get_current_user)]):
-    """Return every blog the current user has generated, newest first.
-
-    Blogs are looked up from their job records server-side, so a user's full
-    history is available even after a frontend reload or backend restart.
-    """
-    blogs = []
-    for record in JOB_MANAGER.list_blogs(user_id):
-        title = extract_blog_title(record)
-        blogs.append(
-            BlogSummary(
-                job_id=record["job_id"],
-                topic=record.get("topic", ""),
-                title=title,
-                created_at=record.get("created_at"),
-                updated_at=record.get("updated_at"),
-            )
-        )
-    return BlogListResponse(blogs=blogs)
+    """Per-user history: every completed blog generated by the caller."""
+    return BlogListResponse(blogs=JOB_MANAGER.list_blogs(user_id))
 
 
-def extract_blog_title(record: dict) -> str:
-    """Best-effort title from the plan JSON, falling back to the first # heading."""
-    plan = record.get("plan")
-    if isinstance(plan, dict) and plan.get("blog_title"):
-        return plan["blog_title"]
-    content = record.get("content") or ""
-    for line in content.splitlines():
-        if line.startswith("# "):
-            return line[2:].strip()
-    return record.get("topic", "")[:80]
+@router.get("/models")
+def list_models():
+    """Available LLM candidates, in fallback order (frontend model picker)."""
+    from app.services.llm import model_candidates
 
-
-@router.get("/metrics")
-def metrics():
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    try:
+        return {"models": model_candidates()}
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get("/health")
 def health():
-    configure_langsmith()
     secrets = get_secrets()
     redis_ready = get_redis_store().available if secrets.redis_url else False
-    jwt_ok = bool(secrets.jwt_secret_key)
-    llm_ok = bool(secrets.groq_api_key)
-    project = active_project()
-    state, auth_detail = auth_state()
     return {
-        # With the in-process job fallback, Redis being down no longer makes
-        # the service unhealthy: auth plus an LLM key are what generation needs.
-        "status": "ok" if jwt_ok and llm_ok else "degraded",
+        "status": "ok" if redis_ready and bool(secrets.jwt_secret_key) else "degraded",
         "authentication": "required",
-        "jwt_configured": jwt_ok,
-        "llm_configured": llm_ok,
         "redis_configured": bool(secrets.redis_url),
         "redis_ready": redis_ready,
-        "jobs_executor": JOB_MANAGER.default_execution_mode,
-        "images_enabled": bool(secrets.pollinations_api_key),
-        "langsmith_tracing": project is not None,
-        "langsmith_project": project,
-        "langsmith_auth": state if state == "ok" else (auth_detail or state),
+        "jwt_configured": bool(secrets.jwt_secret_key),
+        "images_enabled": bool(secrets.gemini_api_key or secrets.google_api_key),
     }

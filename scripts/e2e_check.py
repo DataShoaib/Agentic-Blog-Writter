@@ -16,7 +16,6 @@ import requests
 
 BASE = "http://127.0.0.1:8000"
 TOPIC = sys.argv[1] if len(sys.argv) > 1 else "How does self-attention work in transformers?"
-RESEARCH_MODE = sys.argv[2] if len(sys.argv) > 2 else "auto"
 POLL_TIMEOUT = 600
 
 
@@ -45,7 +44,7 @@ def main() -> int:
     r = requests.post(
         f"{BASE}/api/v1/generate",
         headers=headers,
-        json={"topic": TOPIC, "research_mode": RESEARCH_MODE},
+        json={"topic": TOPIC},
         timeout=30,
     )
     print(f"generate: {r.status_code} {r.json()}")

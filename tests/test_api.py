@@ -16,7 +16,7 @@ def test_generate_returns_queued_job(monkeypatch):
     monkeypatch.setattr(
         JOB_MANAGER,
         "submit",
-        lambda user_id, topic, as_of, research_mode="auto": "job-test-1",
+        lambda user_id, topic, as_of, preferred_model=None: "job-test-1",
     )
     client = TestClient(app)
     response = client.post(
@@ -39,10 +39,3 @@ def test_job_is_not_visible_to_another_user(monkeypatch):
     response = client.get("/api/v1/jobs/job-1")
     assert response.status_code == 404
     app.dependency_overrides[get_current_user] = override_user
-
-
-def test_metrics_endpoint():
-    client = TestClient(app)
-    response = client.get("/api/v1/metrics")
-    assert response.status_code == 200
-    assert "agentic_graph_runs_total" in response.text
