@@ -6,38 +6,33 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class Task(BaseModel):
-    id: int = Field(ge=1)
-    title: str = Field(min_length=3, max_length=120)
-    goal: str = Field(min_length=10, max_length=500)
-    bullets: list[str] = Field(min_length=3, max_length=7)
-    target_words: int = Field(ge=150, le=800)
-    tags: list[str] = Field(default_factory=list, max_length=10)
+    id: int
+    title: str
+    goal: str = Field(..., description="One sentence describing what the reader should do/understand.")
+    bullets: list[str] = Field(..., min_length=3, max_length=6)
+    target_words: int = Field(..., ge=120, le=550, description="Target words (120–550).")
+
+    tags: list[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
     requires_code: bool = False
 
-    @field_validator("bullets")
-    @classmethod
-    def remove_empty_bullets(cls, bullets: list[str]) -> list[str]:
-        cleaned = [bullet.strip() for bullet in bullets if bullet and bullet.strip()]
-        if len(cleaned) < 3:
-            raise ValueError("Each task must contain at least 3 non-empty bullets.")
-        return cleaned[:7]
-
 
 class Plan(BaseModel):
-    blog_title: str = Field(min_length=5, max_length=180)
-    audience: str = Field(min_length=3, max_length=200)
-    tone: str = Field(min_length=3, max_length=120)
+    blog_title: str
+    audience: str
+    tone: str
     blog_kind: Literal[
         "explainer", "tutorial", "news_roundup", "comparison", "system_design"
     ] = "explainer"
-    constraints: list[str] = Field(default_factory=list, max_length=12)
-    tasks: list[Task] = Field(min_length=5, max_length=9)
+    constraints: list[str] = Field(default_factory=list)
+    tasks: list[Task] = Field(..., min_length=1)
 
     @field_validator("tasks")
     @classmethod
     def require_unique_task_ids(cls, tasks: list[Task]) -> list[Task]:
+        """Safety rail: merge_content sorts sections by task.id — duplicate ids
+        would silently overwrite/lose sections."""
         ids = [task.id for task in tasks]
         if len(ids) != len(set(ids)):
             raise ValueError("Plan task IDs must be unique.")
@@ -45,41 +40,52 @@ class Plan(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    title: str = Field(default="", max_length=600)
-    url: str = Field(min_length=10, max_length=2000)
-    published_at: Optional[str] = None
-    snippet: Optional[str] = Field(default=None, max_length=2000)
-    source: Optional[str] = Field(default=None, max_length=200)
+    title: str = ""  # default empty: search results sometimes lack titles (never invent one)
+    url: str
+    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
+    snippet: Optional[str] = None
+    source: Optional[str] = None
 
 
 class RouterDecision(BaseModel):
     needs_research: bool
     mode: Literal["closed_book", "hybrid", "open_book"]
-    reason: str = Field(min_length=5, max_length=500)
-    queries: list[str] = Field(default_factory=list, max_length=10)
-    max_results_per_query: int = Field(default=5, ge=1, le=10)
+    reason: str
+    queries: list[str] = Field(default_factory=list)
+    max_results_per_query: int = Field(default=5)
 
 
 class EvidencePack(BaseModel):
-    evidence: list[EvidenceItem] = Field(default_factory=list, max_length=50)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
 
 
 class ImageSpec(BaseModel):
-    placeholder: str = Field(pattern=r"^\[\[IMAGE_[1-3]\]\]$")
-    filename: str = Field(min_length=3, max_length=160)
-    alt: str = Field(min_length=3, max_length=300)
-    caption: str = Field(min_length=3, max_length=300)
-    prompt: str = Field(min_length=20, max_length=2000)
-    aspect_ratio: Literal["1:1", "16:9", "9:16"] = "16:9"
-    # Optional Mermaid diagram code (e.g. "graph LR; A --> B"). When present,
-    # the diagram is rendered deterministically with crisp text labels instead
-    # of an AI image model.
-    mermaid: str = Field(default="", max_length=4000)
+    placeholder: str = Field(..., pattern=r"^\[\[IMAGE_[1-3]\]\]$", description="e.g. [[IMAGE_1]]")
+    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+    alt: str
+    caption: str
+    prompt: str = Field(..., description="Prompt to send to the image model.")
+    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
+    quality: Literal["low", "medium", "high"] = "medium"
+    section: str = Field(
+        "",
+        description=(
+            "EXACT section heading from the article outline where this image "
+            "belongs (e.g. 'The Double Descent Risk Curve'). Empty defaults to "
+            "the end of the article."
+        ),
+    )
 
 
 class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str
-    images: list[ImageSpec] = Field(default_factory=list, max_length=3)
+    md_with_placeholders: str = Field(
+        "",
+        description=(
+            "Legacy echo field. Placeholders are auto-injected into the full "
+            "article by the graph node, so leave this empty."
+        ),
+    )
+    images: list[ImageSpec] = Field(default_factory=list)
 
 
 class QualityResult(BaseModel):

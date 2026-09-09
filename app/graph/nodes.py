@@ -31,39 +31,19 @@ from app.services.search import dedupe_and_filter, search_web
 
 logger = logging.getLogger(__name__)
 
-ROUTER_SYSTEM = """You are the research router for a technical-content workflow.
-Choose exactly one mode:
-- closed_book: a domain expert can write an accurate, complete article from training knowledge alone. This covers stable concepts, definitions, mathematics, algorithms, architecture patterns, and established tooling (for example: how self-attention works, transformer architecture, REST vs GraphQL, SQL joins, SOLID principles, Big-O analysis).
-- hybrid: evergreen topic where current versions, benchmarks, ecosystem shifts, or recent tooling materially improve the article (for example: "production RAG stack in 2026", "best vector databases today").
-- open_book: volatile information - news, pricing, releases, policies, weekly changes.
-Bias toward closed_book. Research costs latency and quota; use it only when being wrong without sources is likely. When in doubt between closed_book and hybrid for a conceptual topic, choose closed_book.
-Set needs_research=true only for hybrid/open_book, with 3-8 precise search queries.
-Do not claim research has happened in this step."""
+# Canonical prompts live in app/graph/prompts.py (single source of truth).
+from app.graph.prompts import (  # noqa: E402
+    IMAGE_SYSTEM,
+    PLANNER_SYSTEM,
+    QUALITY_SYSTEM,
+    REVISE_SYSTEM,
+    ROUTER_SYSTEM,
+    WORKER_SYSTEM,
+    RESEARCH_SYSTEM,
+)
 
 
 def router_node(state: GraphState) -> dict:
-    override = state.get("research_mode") or "auto"
-
-    if override == "skip":
-        # User explicitly opted out of web research; skip the router LLM call.
-        return {
-            "needs_research": False,
-            "mode": "closed_book",
-            "queries": [],
-            "max_results_per_query": APP_CONFIG.max_research_results,
-            "recency_days": 3650,
-        }
-
-    if override == "force":
-        # User explicitly wants web evidence regardless of topic stability.
-        return {
-            "needs_research": True,
-            "mode": "hybrid",
-            "queries": [state["topic"]],
-            "max_results_per_query": APP_CONFIG.max_research_results,
-            "recency_days": 45,
-        }
-
     decision = invoke_structured(
         RouterDecision,
         [
@@ -71,6 +51,7 @@ def router_node(state: GraphState) -> dict:
             HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
         ],
         operation="router",
+        preferred_model=state.get("model"),
     )
 
     if decision.mode == "open_book":
@@ -80,10 +61,9 @@ def router_node(state: GraphState) -> dict:
     else:
         recency_days = 3650
 
-    needs_research = decision.mode != "closed_book"
+    needs_research = decision.needs_research
     queries = decision.queries[: APP_CONFIG.max_research_queries]
     if needs_research and not queries:
-        # Keep the graph useful even if the model forgets to emit queries.
         queries = [state["topic"]]
 
     logger.info(
@@ -104,16 +84,6 @@ def router_node(state: GraphState) -> dict:
 
 def route_after_router(state: GraphState) -> str:
     return "research" if state.get("needs_research") else "planner"
-
-
-RESEARCH_SYSTEM = """You are a research evidence normalizer.
-Convert raw search results into EvidenceItem objects.
-Rules:
-- Keep only useful, non-empty URLs.
-- Prefer authoritative sources.
-- Never invent dates. Use null when uncertain.
-- Keep snippets concise.
-- Do not infer unsupported facts from a search result."""
 
 
 def research_node(state: GraphState) -> dict:
@@ -137,6 +107,7 @@ def research_node(state: GraphState) -> dict:
             ),
         ],
         operation="research_synthesis",
+        preferred_model=state.get("model"),
     )
 
     evidence = dedupe_and_filter(
@@ -148,29 +119,17 @@ def research_node(state: GraphState) -> dict:
     return {"evidence": evidence[:30]}
 
 
-PLANNER_SYSTEM = """You are a senior technical content architect creating an in-depth article plan.
-Create exactly 6 tasks. Each task targets 350-600 words; the SUM of all target_words must be between 2300 and 3200.
-Keep every string field concise so the JSON stays compact: titles under 60 chars, goals under 160 chars, bullets short phrases (one line each).
-Article structure requirements:
-- Task 1: a compelling introduction - hook, why the topic matters now, what the reader will learn.
-- Middle tasks: deep dives covering mechanisms, tradeoffs, common pitfalls, or a concrete worked example.
-- Include one task with a step-by-step walkthrough or annotated code walkthrough when the topic allows code.
-- One middle task should compare approaches/tools (a Markdown table will be rendered there).
-- Task 6: practical takeaways plus a 3-5 question FAQ and next steps.
-Every task needs 3-5 substantive bullets (each bullet expands into 60-120 words later).
-Avoid filler sections. Depth over breadth.
-For open_book mode, use blog_kind=news_roundup and do not invent events.
-Mark tasks that need current evidence with requires_research=true and requires_citations=true."""
-
-
 def planner_node(state: GraphState) -> dict:
-    evidence = [item.model_dump() for item in state.get("evidence", [])[:10]]
+    mode = state.get("mode", "closed_book")
+    evidence = [item.model_dump() for item in state.get("evidence", [])]
     memory_note = state.get("memory_note") or ""
     memory_block = (
         f"\nPreviously generated articles by this user (do NOT repeat these angles or titles; keep tone consistent):\n{memory_note}\n"
         if memory_note.strip()
         else ""
     )
+    forced_kind = "news_roundup" if mode == "open_book" else None
+
     plan = invoke_structured(
         Plan,
         [
@@ -178,17 +137,18 @@ def planner_node(state: GraphState) -> dict:
             HumanMessage(
                 content=(
                     f"Topic: {state['topic']}\n"
-                    f"Mode: {state.get('mode', 'closed_book')}\n"
-                    f"As-of: {state['as_of']}\n"
-                    f"{memory_block}"
-                    f"Evidence:\n{evidence}"
+                    f"Mode: {mode}\n"
+                    f"As-of: {state['as_of']} (recency_days={state.get('recency_days', 3650)})\n"
+                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                    f"Evidence:\n{evidence[:16]}"
                 )
             ),
         ],
         operation="planner",
+        preferred_model=state.get("model"),
     )
 
-    if state.get("mode") == "open_book":
+    if forced_kind:
         plan.blog_kind = "news_roundup"
     total_words = sum(task.target_words for task in plan.tasks)
     logger.info(
@@ -212,44 +172,32 @@ def fanout(state: GraphState):
                 "topic": state["topic"],
                 "mode": state.get("mode", "closed_book"),
                 "as_of": state["as_of"],
+                "recency_days": state.get("recency_days", 3650),
                 "plan": plan.model_dump(),
                 "evidence": evidence,
                 "memory_note": state.get("memory_note", ""),
+                "model": state.get("model"),
             },
         )
         for task in plan.tasks
     ]
 
 
-WORKER_SYSTEM = """Write exactly one Markdown section for a long-form technical article.
-Start with `## <section title>`.
-
-Depth requirements (this is what separates a great article from a thin one):
-- Open with 1-2 framing sentences that connect to the article's flow.
-- Explain WHY before HOW: mechanisms, intuition, and consequences - not just definitions.
-- Include at least one of per section: a concrete example or mini-scenario, an annotated code snippet, a small Markdown comparison table, or a numbered walkthrough.
-- Expand every bullet into its own sub-section or paragraph cluster (60-120 words each). Never list bullets back verbatim.
-- Use short paragraphs (2-4 sentences), bold key terms, and occasional sub-headings (###) in longer sections.
-- LENGTH FLOOR: write at least the target word count; never below 85% of it. If you finish early, deepen the weakest bullet instead of stopping.
-
-Integrity rules:
-- Never invent specific current events, company claims, model releases, pricing, or policy claims.
-- For current claims, cite only the supplied approved evidence URLs.
-- If requires_citations=true and evidence does not support a current claim, say it is not established by the provided sources.
-- If requires_code=true, include a minimal useful code snippet.
-Output only the section Markdown."""
-
-
 def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
-    evidence = payload.get("evidence", [])
+    evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
     # Spread parallel workers across the model fallback chain so concurrent
     # sections draw from separate provider rate-limit buckets instead of all
-    # hammering one pool at the same instant.
-    candidates = model_candidates()
-    preferred = candidates[(task.id - 1) % len(candidates)] if candidates else None
+    # hammering one pool at the same instant. A user-selected model wins; the
+    # round-robin spread is the fallback when none is given.
+    explicit_model = payload.get("model")
+    if explicit_model:
+        preferred = explicit_model if explicit_model in model_candidates() else None
+    else:
+        candidates = model_candidates()
+        preferred = candidates[(task.id - 1) % len(candidates)] if candidates else None
     if task.id > 1:
         time.sleep(min(APP_CONFIG.worker_start_delay_seconds * (task.id - 1), 3.0))
 
@@ -260,11 +208,10 @@ def worker_node(payload: dict) -> dict:
         else ""
     )
 
+    bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
-        f"- {item.get('title', '')} | {item.get('url', '')} | "
-        f"{item.get('published_at') or 'date:unknown'} | "
-        f"{(item.get('snippet') or '')[:500]}"
-        for item in evidence[:20]
+        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
+        for e in evidence[:20]
     )
 
     section = invoke_text(
@@ -276,16 +223,20 @@ def worker_node(payload: dict) -> dict:
                     f"Audience: {plan.audience}\n"
                     f"Tone: {plan.tone}\n"
                     f"Blog kind: {plan.blog_kind}\n"
+                    f"Constraints: {plan.constraints}\n"
+                    f"Topic: {payload['topic']}\n"
                     f"Mode: {payload.get('mode')}\n"
-                    f"{memory_block}"
+                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n"
+                    f"{memory_block}\n"
                     f"Section title: {task.title}\n"
                     f"Goal: {task.goal}\n"
                     f"Target words: {task.target_words}\n"
-                    f"requires_research={task.requires_research}\n"
-                    f"requires_citations={task.requires_citations}\n"
-                    f"requires_code={task.requires_code}\n"
-                    f"Bullets:\n- " + "\n- ".join(task.bullets) +
-                    f"\nApproved evidence:\n{evidence_text}"
+                    f"Tags: {task.tags}\n"
+                    f"requires_research: {task.requires_research}\n"
+                    f"requires_citations: {task.requires_citations}\n"
+                    f"requires_code: {task.requires_code}\n"
+                    f"Bullets:{bullets_text}\n\n"
+                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
                 )
             ),
         ],
@@ -307,16 +258,6 @@ def merge_content(state: GraphState) -> dict:
 
     body = "\n\n".join(markdown for _, markdown in sections).strip()
     return {"merged_md": f"# {plan.blog_title}\n\n{body}\n"}
-
-
-QUALITY_SYSTEM = """Review the generated technical article against its plan and approved evidence.
-Be strict about:
-- unsupported current claims,
-- missing required bullets or thin sections that ignore planned depth,
-- LENGTH: the article must be at least 90% of the summed plan target_words. A short article fails completeness.
-- missing citations where required,
-- obvious structural/instruction-following failures (no intro hook, no examples/tables/code where planned, no FAQ/takeaways ending).
-Return QualityResult only. Do not rewrite the article."""
 
 
 def _word_count(text: str) -> int:
@@ -343,6 +284,7 @@ def quality_gate(state: GraphState) -> dict:
                 ),
             ],
             operation="quality_gate",
+            preferred_model=state.get("model"),
         )
     except LLMGatewayError as exc:
         # The merged article already exists; losing it to an LLM quota error
@@ -418,14 +360,7 @@ def revise_content(state: GraphState) -> dict:
     issues = state.get("quality", {}).get("issues", [])
     revised = invoke_text(
         [
-            SystemMessage(
-                content="""Revise the Markdown article to fix the listed quality issues.
-When an issue says the article is too short, EXPAND the thin sections substantially:
-deepen explanations (mechanisms, tradeoffs, pitfalls), add concrete examples, comparison
-tables or annotated code, and grow every underdeveloped bullet into full paragraphs.
-Preserve accurate content and overall section structure; never shrink the article.
-Do not add unsupported facts or citations. Output only the revised Markdown."""
-            ),
+            SystemMessage(content=REVISE_SYSTEM),
             HumanMessage(
                 content=(
                     f"Plan: {plan.model_dump()}\n"
@@ -435,6 +370,7 @@ Do not add unsupported facts or citations. Output only the revised Markdown."""
             ),
         ],
         operation="revision",
+        preferred_model=state.get("model"),
     )
     return {
         "merged_md": revised,
@@ -442,55 +378,113 @@ Do not add unsupported facts or citations. Output only the revised Markdown."""
     }
 
 
-IMAGE_SYSTEM = """You are a technical visual editor.
-Choose at most 3 diagrams that materially improve understanding.
-Prefer architecture, workflow, lifecycle, or comparison visuals.
-Avoid decoration.
-If no diagram is useful, return the original Markdown and an empty image list.
-Use placeholders exactly [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+# Image planning operates on a compact section outline, NOT the full article.
+# Sending the whole article forced the planning model to echo it back — and
+# when the article exceeded the token budget the echo came back TRUNCATED,
+# which silently cut every generated blog in half. We now let the planner only
+# decide WHICH sections deserve a diagram (via the ImageSpec.section anchor)
+# and inject the [[IMAGE_n]] placeholder into the full merged article below.
+_IMAGE_PLANNING_MAX_SECTIONS = 40
 
-For every image you MUST also provide a "mermaid" field containing valid
-Mermaid diagram code (flowchart, sequence, or class diagram) that captures the
-same structure as the prompt, e.g.:
-"graph LR; A[Input] --> B[Attention]; B --> C[Output]"
-Rules: use only Mermaid v10 syntax; quote labels containing special
-characters; keep under 25 nodes; never call external services. The mermaid
-code is rendered with crisp text labels, so node labels must be concise and
-readable."""
 
-# Cap the article sent to image planning (~1200 tokens) so the request fits
-# within small LLM rate-limit budgets such as the Groq free tier (8k TPM).
-_IMAGE_PLANNING_MAX_CHARS = 4800
+def _section_outline(md: str) -> list[tuple[str, str]]:
+    """Compact per-section summary for image planning.
+
+    Returns (heading, leading body text) pairs. Only this outline is sent to
+    the LLM, so the response can never overwrite or truncate the article.
+    """
+    outline: list[tuple[str, str]] = []
+    current: tuple[str, list[str]] | None = None
+
+    def _flush() -> None:
+        nonlocal current
+        if current is not None:
+            heading, body = current
+            outline.append((heading.strip(), " ".join(body).strip()))
+            current = None
+
+    for line in md.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            _flush()
+            current = (stripped[3:].strip("#").strip(), [])
+        elif stripped and current is not None:
+            current[1].append(stripped[:180])
+    _flush()
+    return outline[:_IMAGE_PLANNING_MAX_SECTIONS]
+
+
+def _heading_insert_index(md: str, heading: str) -> int | None:
+    """Return the line index after the best-matching ``## <heading>``."""
+    want = re.sub(r"[^a-z0-9]+", " ", heading.lower()).strip()
+    for idx, line in enumerate(md.splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            continue
+        candidate = stripped[3:].strip("#").strip().lower()
+        candidate = re.sub(r"[^a-z0-9]+", " ", candidate).strip()
+        if candidate and candidate == want:
+            return idx + 1
+    return None
+
+
+def _inject_placeholder(md: str, spec: dict) -> str:
+    """Insert one ``[[IMAGE_n]]`` placeholder into the FULL article.
+
+    Anchors to the matching section heading; falls back to just before the
+    Sources section, then to the end of the article. The article itself is
+    never truncated or rewritten.
+    """
+    placeholder = spec.get("placeholder", "")
+    if not placeholder:
+        return md
+
+    lines = md.splitlines()
+    target = _heading_insert_index(md, spec.get("section", ""))
+    if target is None:
+        target = next(
+            (idx for idx, line in enumerate(lines) if line.strip().startswith("## Sources")),
+            len(lines),
+        )
+    while target < len(lines) and not lines[target].strip():
+        target += 1
+    lines.insert(target, placeholder)
+    lines.insert(target, "")
+    return "\n".join(lines)
 
 
 def decide_images(state: GraphState) -> dict:
     if not state.get("enable_images", True):
-        return {"merged_md": state["merged_md"], "image_specs": []}
+        return {"md_with_placeholders": state["merged_md"], "image_specs": []}
 
-    # Trim the article for planning: the visual editor only needs structure
-    # (headings + surrounding text), and small LLM budgets (e.g. Groq free
-    # tier TPM limits) cannot fit a full-length article.
-    article = state["merged_md"]
-    if len(article) > _IMAGE_PLANNING_MAX_CHARS:
-        article = article[:_IMAGE_PLANNING_MAX_CHARS] + "\n\n[...article truncated...]"
-
-    plan = invoke_structured(
+    merged_md = state["merged_md"]
+    outline = _section_outline(merged_md)
+    plan = state.get("plan")
+    image_plan = invoke_structured(
         GlobalImagePlan,
         [
             SystemMessage(content=IMAGE_SYSTEM),
             HumanMessage(
                 content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Article:\n{article}"
+                    f"Blog kind: {plan.blog_kind if plan else 'explainer'}\n"
+                    f"Topic: {state['topic']}\n\n"
+                    f"Section outline:\n{outline}\n\n"
+                    "Decide which sections (max 3) genuinely benefit from a "
+                    "technical diagram. For each, set ImageSpec.section to the "
+                    "EXACT heading text from the outline. Only image specs are "
+                    "used; md_with_placeholders stays empty."
                 )
             ),
         ],
         operation="image_planning",
+        preferred_model=state.get("model"),
     )
-    return {
-        "merged_md": plan.md_with_placeholders,
-        "image_specs": [item.model_dump() for item in plan.images],
-    }
+
+    specs = [item.model_dump() for item in image_plan.images]
+    md_with_placeholders = merged_md
+    for spec in specs:
+        md_with_placeholders = _inject_placeholder(md_with_placeholders, spec)
+    return {"md_with_placeholders": md_with_placeholders, "image_specs": specs}
 
 
 def _slug(text: str) -> str:
@@ -511,11 +505,14 @@ def generate_and_place_images(state: GraphState) -> dict:
     if plan is None:
         raise ValueError("Image generation requires a plan.")
 
-    md = state.get("merged_md", "")
+    md = state.get("md_with_placeholders") or state.get("merged_md", "")
     specs = state.get("image_specs", [])
     job_id = state.get("job_id", "local")
     asset_dir = Path("images") / re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
     asset_dir.mkdir(parents=True, exist_ok=True)
+
+    # ImageSpec.size (pixel notation) mapped onto Gemini's aspect ratios.
+    size_to_aspect = {"1024x1024": "1:1", "1024x1536": "9:16", "1536x1024": "16:9"}
 
     for spec in specs[:3]:
         filename = _safe_filename(spec["filename"])
@@ -525,8 +522,7 @@ def generate_and_place_images(state: GraphState) -> dict:
                 generate_image(
                     spec["prompt"],
                     path,
-                    spec.get("aspect_ratio", "16:9"),
-                    mermaid=spec.get("mermaid", "") or "",
+                    size_to_aspect.get(spec.get("size", "1024x1024"), "16:9"),
                 )
             image_url = f"/assets/images/{asset_dir.name}/{filename}"
             replacement = f"![{spec['alt']}]({image_url})\n*{spec['caption']}*"

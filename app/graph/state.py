@@ -9,7 +9,6 @@ from app.graph.schemas import EvidenceItem, Plan
 class GraphState(TypedDict, total=False):
     topic: str
     mode: str
-    research_mode: str
     needs_research: bool
     queries: list[str]
     max_results_per_query: int
@@ -19,6 +18,7 @@ class GraphState(TypedDict, total=False):
     recency_days: int
     sections: Annotated[list[tuple[int, str]], operator.add]
     merged_md: str
+    md_with_placeholders: str
     quality: dict
     revision_count: int
     max_revision_attempts: int
@@ -28,3 +28,4 @@ class GraphState(TypedDict, total=False):
     job_id: str
     user_id: str
     memory_note: str
+    model: str | None
