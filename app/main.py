@@ -7,11 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import JOB_MANAGER, router
-from app.observability.tracing import configure_langsmith
-
-# Enable LangSmith tracing before anything builds an LLM client, so the whole
-# graph (not just chat calls) lands in the trace tree from the first request.
-configure_langsmith()
 
 
 @asynccontextmanager
@@ -31,7 +26,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,6 +47,5 @@ def root():
         "name": "Agentic Content Orchestrator",
         "version": "2.0.0",
         "docs": "/docs",
-        "metrics": "/api/v1/metrics",
         "auth": "/api/v1/auth/token",
     }

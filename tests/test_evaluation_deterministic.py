@@ -199,8 +199,8 @@ def test_compute_cost_requires_known_usage():
     assert compute_cost([]) is None
     unknown = [{"model": "mystery-model", "prompt_tokens": 10, "completion_tokens": 10}]
     assert compute_cost(unknown) is None  # never invent cost
-    known = [{"model": "openai/gpt-oss-20b", "prompt_tokens": 1_000_000, "completion_tokens": 0}]
-    assert compute_cost(known) == 0.07
+    known = [{"model": "gemini/gemini-2.5-flash", "prompt_tokens": 1_000_000, "completion_tokens": 0}]
+    assert compute_cost(known) == 0.30
 
 
 # ------------------------------------------------------- judge schemas -------

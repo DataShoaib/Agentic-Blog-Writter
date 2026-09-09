@@ -39,6 +39,44 @@ def check_workflow_success(state: dict | None, error: str | None = None) -> Eval
     return EvalCheck("workflow_success", True)
 
 
+# ---------------------------------------------------------------- cost -------
+# USD per 1M tokens: (input, output). Only models with known published prices
+# are listed; unknown models make the cost report return None (never invent).
+_MODEL_COST_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gemini/gemini-2.5-flash": (0.30, 2.50),
+    "gemini/gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini/gemini-2.0-flash": (0.10, 0.40),
+}
+
+
+def p95(values: list[float] | None) -> float | None:
+    """Nearest-rank 95th percentile; None for empty input."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    import math
+
+    index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return ordered[index]
+
+
+def compute_cost(usage: list[dict] | None) -> float | None:
+    """Average-independent total cost in USD, or None when usage is missing
+    or contains any model with unknown pricing."""
+    if not usage:
+        return None
+    total = 0.0
+    for entry in usage:
+        rates = _MODEL_COST_PER_MTOK.get(entry.get("model", ""))
+        if rates is None:
+            return None
+        total += (
+            entry.get("prompt_tokens", 0) / 1_000_000 * rates[0]
+            + entry.get("completion_tokens", 0) / 1_000_000 * rates[1]
+        )
+    return round(total, 6)
+
+
 # ------------------------------------------------------------ structure ------
 def check_structural_integrity(state: dict) -> EvalCheck:
     """Plan vs worker outputs vs merged document consistency."""
