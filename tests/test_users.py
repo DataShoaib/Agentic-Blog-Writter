@@ -1,10 +1,28 @@
+import pytest
 from pwdlib import PasswordHash
 
-from app.services.users import UserStore
+from app.services import db
+from app.services.users import get_user_store
+
+pytestmark = pytest.mark.usefixtures("requires_db")
 
 
-def test_user_store_creates_and_reads_hashed_user(tmp_path):
-    store = UserStore(str(tmp_path / "users.sqlite3"))
+@pytest.fixture(autouse=True)
+def _clean_users(requires_db):
+    """The Postgres users table is shared; start every test from an empty one.
+
+    Depends on ``requires_db`` so the suite skips cleanly when Postgres is not
+    reachable (no DB connect is even attempted in that case).
+    """
+    store = get_user_store()
+    with store._lock, store._connect() as conn:
+        conn.execute(db.q("DELETE FROM users"))
+        conn.commit()
+    yield
+
+
+def test_user_store_creates_and_reads_hashed_user():
+    store = get_user_store()
     password_hash = PasswordHash.recommended().hash("secret-password")
 
     assert store.create("writer", password_hash, "2026-08-20T00:00:00+00:00")
@@ -16,8 +34,8 @@ def test_user_store_creates_and_reads_hashed_user(tmp_path):
     assert PasswordHash.recommended().verify("secret-password", user["password_hash"])
 
 
-def test_user_store_rejects_duplicate_username_case_insensitively(tmp_path):
-    store = UserStore(str(tmp_path / "users.sqlite3"))
+def test_user_store_rejects_duplicate_username_case_insensitively():
+    store = get_user_store()
     password_hash = PasswordHash.recommended().hash("secret-password")
 
     assert store.create("writer", password_hash, "2026-08-20T00:00:00+00:00")
