@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from app.config import APP_CONFIG, get_secrets
-from app.observability.metrics import CACHE_HITS, CACHE_MISSES
+# Metrics removed - using LangSmith for observability instead
 
 
 class RedisStore:
@@ -58,12 +58,9 @@ class RedisStore:
         try:
             value = self._client.get(key)
             if value is None:
-                CACHE_MISSES.inc()
                 return None
-            CACHE_HITS.inc()
             return json.loads(value)
         except Exception:
-            CACHE_MISSES.inc()
             return None
 
     def set_json(self, key: str, value: Any, ttl: int) -> None:
@@ -125,3 +122,107 @@ def allow_request(identity: str) -> bool:
     if count is not None:
         return count <= APP_CONFIG.rate_limit_per_minute
     return _LOCAL_LIMITER.allow(identity, APP_CONFIG.rate_limit_per_minute)
+
+
+# ---------------------------------------------------------------------------
+# Whole-blog result cache (Redis-backed, universal)
+# ---------------------------------------------------------------------------
+#
+# A generation pipeline is expensive, so identical requests are short-circuited
+# back to the cached article instead of re-running the full graph. The cache is
+# NOT user-scoped: the key is (topic, as_of), so once any user
+# generates a blog, every user requesting the same input is served from cache.
+
+from dataclasses import dataclass  # noqa: E402
+from typing import Optional  # noqa: E402 — Any already imported at top of module
+
+
+BLOG_CACHE_TTL_SECONDS = 7 * 24 * 3600  # one week
+
+
+@dataclass
+class CachedBlog:
+    """Snapshot of a finished blog stored in / loaded from Redis."""
+
+    content: str
+    plan: dict
+    evidence: list[dict]
+
+
+class BlogCache:
+    def __init__(self, ttl_seconds: int = BLOG_CACHE_TTL_SECONDS):
+        self.ttl_seconds = ttl_seconds
+        self._store = get_redis_store()
+
+    @staticmethod
+    def _cache_key(topic: str, as_of: str) -> str:
+        """Universal key: identical input shares one entry across all users."""
+        raw = f"{topic.strip()}|{as_of}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _redis_key(self, topic: str, as_of: str) -> str:
+        return cache_key("blog", self._cache_key(topic, as_of))
+
+    def available(self) -> bool:
+        return self._store.available
+
+    def get(
+        self,
+        topic: str,
+        as_of: str,
+    ) -> Optional[CachedBlog]:
+        if not self._store.available:
+            return None
+
+        data = self._store.get_json(
+            self._redis_key(topic, as_of)
+        )
+
+        if not data:
+            return None
+
+        return CachedBlog(
+            content=data.get("content", ""),
+            plan=data.get("plan") or {},
+            evidence=data.get("evidence") or [],
+        )
+
+    @staticmethod
+    def _to_dict(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "__dict__"):
+            return vars(obj)
+        return obj
+
+    def set(
+        self,
+        topic: str,
+        as_of: str,
+        content: str,
+        plan: Any,
+        evidence: list[Any],
+    ) -> None:
+        if not self._store.available:
+            return
+
+        try:
+            payload = {
+                "content": content,
+                "plan": self._to_dict(plan),
+                "evidence": [self._to_dict(item) for item in evidence],
+            }
+
+            self._store.set_json(
+                self._redis_key(topic, as_of),
+                payload,
+                self.ttl_seconds,
+            )
+        except Exception:
+            pass
+
+
+def get_blog_cache() -> BlogCache:
+    return BlogCache()
