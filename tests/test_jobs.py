@@ -1,8 +1,23 @@
 import pytest
 
+from app.services import db
 from app.services.jobs import JobStore
 
 pytestmark = pytest.mark.usefixtures("requires_db")
+
+
+@pytest.fixture(autouse=True)
+def _clean_test_jobs(requires_db):
+    """The Postgres jobs table is shared; remove the fixed-id test rows first.
+
+    Depends on ``requires_db`` so the suite skips cleanly when Postgres is not
+    reachable (no DB connect is even attempted in that case).
+    """
+    store = JobStore()
+    with store._lock, store._connect() as conn:
+        conn.execute(db.q("DELETE FROM jobs WHERE job_id IN ('job-1', 'job-2')"))
+        conn.commit()
+    yield
 
 
 def test_job_store_round_trip():

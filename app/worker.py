@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+
 from redis import Redis
-from rq import Worker
+from rq import SimpleWorker, Worker
 
 from app.config import get_secrets
 from app.observability.tracing import configure_langsmith
@@ -20,10 +22,14 @@ def main() -> None:
         pass
 
     connection = Redis.from_url(redis_url)
-    Worker(
+    # RQ's default worker forks a work horse, which is not available on
+    # Windows. SimpleWorker runs jobs in-process there instead. A pid-unique
+    # name avoids "active worker already" clashes after unclean restarts.
+    worker_cls = SimpleWorker if os.name == "nt" else Worker
+    worker_cls(
         [JOB_QUEUE_NAME],
         connection=connection,
-        name="blog-generation-worker",
+        name=f"blog-generation-worker-{os.getpid()}",
     ).work()
 
 
