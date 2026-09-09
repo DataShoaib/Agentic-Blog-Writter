@@ -10,56 +10,179 @@ from pathlib import Path
 import requests
 import streamlit as st
 
-
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
-OUTPUTS_DIR = Path("outputs")
 IMAGES_DIR = Path("images")
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 
 st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✦", layout="wide")
-st.markdown(
-    """
-    <style>
-    :root { color-scheme: light; }
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * {
-        color: #172033 !important;
-    }
-    [data-testid="stAppViewContainer"] { background: #f5f7fb; }
-    [data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #dbe2ec; }
-    [data-testid="stHeader"] { background: #f5f7fb; }
-    [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea,
-    [data-baseweb="select"] *, [data-baseweb="input"] * {
-        color: #172033 !important; background: #ffffff !important;
-    }
-    [data-testid="stTextInput"] input::placeholder, [data-testid="stTextArea"] textarea::placeholder {
-        color: #718096 !important;
-    }
-    [data-testid="stButton"] button, [data-testid="stFormSubmitButton"] button,
-    [data-testid="stDownloadButton"] button {
-        color: #172033 !important; background: #ffffff !important; border-color: #b8c4d4 !important;
-    }
-    [data-testid="stButton"] button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] {
-        color: #ffffff !important; background: #0b63ce !important; border-color: #0b63ce !important;
-    }
-    [data-testid="stExpander"] details, [data-testid="stStatusWidget"] {
-        background: #ffffff !important; border: 1px solid #dbe2ec !important;
-    }
-    [data-baseweb="tab-list"] { gap: 8px; }
-    [data-baseweb="tab"] { color: #53657d !important; }
-    [aria-selected="true"] { color: #0b63ce !important; border-bottom-color: #0b63ce !important; }
-    [data-testid="stCode"] *, code, pre, [data-testid="stCodeBlock"] * {
-        color: #172033 !important; background: #eef2f7 !important;
-    }
-    [data-testid="stMarkdownContainer"] a { color: #0b63ce !important; }
-    [data-testid="stDataFrame"] * { color: #172033 !important; }
-    .hero { padding: 1.5rem 0 .8rem; }
-    .hero h1 { color: #10233f; font-size: 2.4rem; margin-bottom: .25rem; }
-    .hero p { color: #53657d; font-size: 1.05rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * {
+    font-family: 'Inter', 'Segoe UI', -apple-system, sans-serif;
+}
+
+/* ---------- shell ---------- */
+[data-testid="stAppViewContainer"] {
+    background:
+        radial-gradient(640px 320px at 88% -6%, rgba(124,58,237,.13), transparent 62%),
+        radial-gradient(720px 360px at -8% 12%, rgba(79,70,229,.09), transparent 60%),
+        #f4f5fa;
+}
+[data-testid="stHeader"] { background: transparent; }
+#MainMenu, footer { visibility: hidden; }
+.block-container { padding-top: 2.2rem; padding-bottom: 4rem; max-width: 62rem; }
+
+/* ---------- sidebar: dark history rail ---------- */
+[data-testid="stSidebar"] {
+    background: #0e1220 !important;
+    border-right: 1px solid rgba(255,255,255,.07);
+}
+[data-testid="stSidebar"] * { color: #c9d1e8 !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.09) !important; margin: .8rem 0 !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { margin-bottom: .05rem; }
+
+.brand { display: flex; align-items: center; gap: .6rem; padding: .3rem .1rem .65rem; }
+.brand-badge {
+    width: 36px; height: 36px; border-radius: 11px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, #4f46e5, #8b5cf6);
+    color: #fff !important; font-size: 1.1rem; font-weight: 800;
+}
+.brand-name { font-size: 1rem; font-weight: 700; color: #f2f4fb !important; line-height: 1.15; }
+.brand-sub { font-size: .7rem; color: #8b93ad !important; }
+
+[data-testid="stSidebar"] button {
+    border: none !important; box-shadow: none !important; background: transparent !important;
+}
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"],
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
+    justify-content: flex-start; text-align: left; width: 100%;
+    border-radius: 11px !important; padding: .45rem .7rem !important;
+    font-size: .855rem !important; font-weight: 500;
+    transition: background .15s ease, color .15s ease;
+}
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]:hover {
+    background: rgba(255,255,255,.08) !important; color: #fff !important;
+}
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
+    color: #fff !important; justify-content: center; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(79,70,229,.38) !important;
+}
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover { filter: brightness(1.08); }
+
+.user-chip {
+    display: flex; align-items: center; gap: .5rem;
+    background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.09);
+    border-radius: 12px; padding: .5rem .7rem; font-size: .84rem; color: #dfe4f3 !important;
+}
+
+/* ---------- cards ---------- */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #ffffff;
+    border: 1px solid #e7eaf3 !important;
+    border-radius: 20px;
+    box-shadow: 0 10px 34px rgba(23,28,63,.07);
+}
+</style>
+"""
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+MORE_CSS = """
+<style>
+/* ---------- typography ---------- */
+.main-title { font-size: 2.15rem; font-weight: 800; color: #141a33; letter-spacing: -.02em; margin: 0 0 .2rem; }
+.main-sub { color: #626b85; font-size: .98rem; margin: 0 0 1.1rem; }
+.auth-title { font-size: 1.35rem; font-weight: 800; color: #141a33; margin: .1rem 0 .15rem; text-align: center; }
+.auth-sub { color: #626b85; font-size: .86rem; margin: 0 0 1rem; text-align: center; }
+.auth-badge {
+    width: 46px; height: 46px; border-radius: 14px; margin: .2rem auto .8rem;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, #4f46e5, #8b5cf6);
+    color: #fff !important; font-size: 1.3rem; font-weight: 800;
+}
+.article-title { font-size: 1.45rem; font-weight: 800; color: #141a33; letter-spacing: -.01em; margin: 0; }
+.meta-chip {
+    display: inline-block; background: #eef0f9; color: #4d566f !important;
+    border-radius: 999px; padding: .18rem .65rem; font-size: .74rem; font-weight: 600; margin-right: .4rem;
+}
+
+/* ---------- inputs ---------- */
+[data-testid="stTextArea"] textarea {
+    border-radius: 14px !important; border: 1.5px solid #e3e7f2 !important;
+    background: #fbfcff !important; color: #1c2340 !important; font-size: .95rem;
+    padding: .8rem .9rem !important; transition: border .15s ease, box-shadow .15s ease;
+}
+[data-testid="stTextArea"] textarea:focus {
+    border-color: #6d5cf0 !important; box-shadow: 0 0 0 3px rgba(109,92,240,.16) !important; outline: none;
+}
+[data-testid="stTextArea"] textarea::placeholder { color: #9aa3bd !important; }
+
+[data-testid="stTextInput"] input {
+    border-radius: 12px !important; border: 1.5px solid #e3e7f2 !important;
+    background: #fbfcff !important; color: #1c2340 !important;
+}
+[data-testid="stTextInput"] input:focus {
+    border-color: #6d5cf0 !important; box-shadow: 0 0 0 3px rgba(109,92,240,.15) !important;
+}
+[data-testid="stTextInput"] label, [data-testid="stDateInput"] label {
+    font-weight: 600 !important; color: #3d466b !important; font-size: .84rem;
+}
+
+[data-testid="stDateInput"] input {
+    border-radius: 11px !important; border: 1.5px solid #e3e7f2 !important;
+    background: #fbfcff !important; color: #1c2340 !important; font-size: .86rem !important;
+}
+
+/* model popover pill */
+[data-testid="stPopover"] button {
+    border-radius: 999px !important; border: 1.5px solid #e3e7f2 !important;
+    background: #ffffff !important; color: #3d466b !important;
+    font-size: .84rem !important; font-weight: 600; padding: .42rem .9rem !important;
+    box-shadow: none !important; transition: border .15s ease;
+}
+[data-testid="stPopover"] button:hover { border-color: #c7cbf5 !important; }
+
+/* ---------- buttons ---------- */
+[data-testid="stBaseButton-primary"] {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
+    color: #fff !important; border: none !important; border-radius: 12px !important;
+    font-weight: 600 !important; box-shadow: 0 6px 18px rgba(79,70,229,.30) !important;
+    transition: filter .15s ease;
+}
+[data-testid="stBaseButton-primary"]:hover { filter: brightness(1.08); }
+[data-testid="stBaseButton-secondary"] {
+    border-radius: 12px !important; background: #fff !important;
+    border: 1.5px solid #e3e7f2 !important; color: #3d466b !important; font-weight: 500;
+}
+[data-testid="stBaseButton-secondary"]:hover { border-color: #c7cbf5 !important; color: #4f46e5 !important; }
+
+/* ---------- tabs as segmented control ---------- */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 5px; background: #edeff7; padding: 4px; border-radius: 13px;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    border-radius: 10px !important; color: #5b6480 !important; font-weight: 600;
+    font-size: .88rem; background: transparent; border: none !important;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    background: #ffffff !important; color: #141a33 !important;
+    box-shadow: 0 2px 8px rgba(23,28,63,.10);
+}
+[data-testid="stTabs"] [data-baseweb="tab-highlight"],
+[data-testid="stTabs"] [data-baseweb="tab-border"] { display: none; }
+
+/* ---------- misc ---------- */
+[data-testid="stMarkdownContainer"] a { color: #4f46e5; }
+[data-testid="stExpander"] details { border-radius: 12px !important; border: 1px solid #e7eaf3 !important; }
+[data-testid="stDataFrame"] { border-radius: 12px; }
+[data-testid="stAlert"] { border-radius: 12px !important; }
+</style>
+"""
+st.markdown(MORE_CSS, unsafe_allow_html=True)
 
 def api_request(method: str, path: str, **kwargs) -> requests.Response:
     response = requests.request(method, f"{API_BASE_URL}{path}", timeout=30, **kwargs)
@@ -144,7 +267,6 @@ def bundle_bytes(markdown: str, title: str) -> bytes:
                     archive.write(path, arcname=str(path))
     return buffer.getvalue()
 
-
 def signup_panel() -> None:
     with st.form("signup-form"):
         username = st.text_input("Username", placeholder="writer")
@@ -154,10 +276,10 @@ def signup_panel() -> None:
         username = (username or "").strip()
         password = password or ""
         if len(password) < 8:
-            st.error("❌ Password must be at least 8 characters. You entered " + str(len(password)) + ".")
+            st.error("Password must be at least 8 characters. You entered " + str(len(password)) + ".")
             return
         if not re.match(r"^[A-Za-z0-9_.-]+$", username):
-            st.error("❌ Username may only contain letters, numbers, dots, dashes and underscores (no spaces or @).")
+            st.error("Username may only contain letters, numbers, dots, dashes and underscores.")
             return
         response = api_request(
             "POST", "/api/v1/auth/signup", json={"username": username, "password": password}
@@ -174,6 +296,7 @@ def signup_panel() -> None:
         if login.ok:
             st.session_state.token = login.json()["access_token"]
             st.session_state.refresh_token = login.json()["refresh_token"]
+            st.session_state.username = username
             st.session_state.signup_done = True
             st.rerun()
         else:
@@ -209,6 +332,7 @@ def login_panel() -> None:
         if response.ok:
             st.session_state.token = response.json()["access_token"]
             st.session_state.refresh_token = response.json()["refresh_token"]
+            st.session_state.username = login_username
             st.session_state.pop("login_username", None)
             st.session_state.pop("login_password", None)
             st.rerun()
@@ -217,118 +341,202 @@ def login_panel() -> None:
             show_error(response)
 
 
-def authenticated_workspace() -> None:
-    token = st.session_state.get("token")
-    if st.session_state.pop("signup_done", False):
-        st.success("Welcome! Your account is ready — you're signed in.")
-    with st.sidebar:
-        st.header("Generate New Blog")
-        topic = st.text_area("Topic", placeholder="How should production RAG systems be evaluated?", height=120)
-        as_of = st.date_input("As-of date", value=None, help="Leave blank for today. Limits research to this date or earlier.")
-        preferred_model = st.session_state.get("_model_options")
-        model_choice = st.selectbox(
-            "Preferred model",
-            ["(fallback chain)"] + (preferred_model or []),
-            index=0,
-            help="Primary LLM for drafting/review. The fallback chain kicks in on quota errors.",
-        )
-        submitted = st.button("Generate Blog", type="primary", use_container_width=True)
-        st.divider()
+def auth_screen() -> None:
+    """Modern centered auth card (Claude/Notion style)."""
+    _, mid, _ = st.columns([1.1, 1, 1.1], gap="large")
+    with mid:
+        with st.container(border=True):
+            st.markdown('<div class="auth-badge">✦</div>', unsafe_allow_html=True)
+            st.markdown('<p class="auth-title">Welcome to Agentic Writer</p>', unsafe_allow_html=True)
+            st.markdown(
+                '<p class="auth-sub">Research, draft and polish long-form articles — in one place.</p>',
+                unsafe_allow_html=True,
+            )
+            tab_login, tab_signup = st.tabs(["Log in", "Create account"])
+            with tab_login:
+                login_panel()
+            with tab_signup:
+                signup_panel()
 
-        st.subheader("My past blogs")
-        try:
-            history = api_request("GET", "/api/v1/blogs", headers={"Authorization": f"Bearer {token}"})
-            blogs = history.json().get("blogs", []) if history.ok else []
-        except Exception:
-            blogs = []
-        if not blogs:
-            st.caption("No blogs generated yet.")
-        else:
-            labels = [f"{blog['title']} · {blog['created_at'][:10]}" for blog in blogs]
-            choice = st.selectbox("Select a blog", labels, label_visibility="collapsed")
-            if st.button("Load selected blog", use_container_width=True):
-                selected = blogs[labels.index(choice)]
+def history_rail(health: dict | None) -> None:
+    """ChatGPT-style sidebar: brand, new-blog button, clickable history, user chip."""
+    st.markdown(
+        '<div class="brand"><div class="brand-badge">✦</div>'
+        '<div><div class="brand-name">Agentic Writer</div>'
+        '<div class="brand-sub">research → article</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("New blog", icon=":material/add_circle:", type="primary", use_container_width=True, key="new_blog"):
+        for key in ("last_content", "last_job_id", "last_plan", "last_evidence", "last_timestamps"):
+            st.session_state.pop(key, None)
+        st.rerun()
+    st.divider()
+    st.caption("HISTORY")
+
+    token = st.session_state.get("token")
+    try:
+        history = api_request("GET", "/api/v1/blogs", headers={"Authorization": f"Bearer {token}"})
+        blogs = history.json().get("blogs", []) if history.ok else []
+    except Exception:
+        blogs = []
+
+    if not blogs:
+        st.caption("No blogs yet. Articles you generate will show up here.")
+    else:
+        for blog in blogs:
+            created = (blog.get("created_at") or "")[:10]
+            label = f"{blog['title']}  ·  {created}" if created else blog["title"]
+            if st.button(
+                label,
+                icon=":material/description:",
+                key=f"hist_{blog['job_id']}",
+                use_container_width=True,
+                help="Open this article",
+            ):
                 result = api_request(
                     "GET",
-                    f"/api/v1/jobs/{selected['job_id']}",
+                    f"/api/v1/jobs/{blog['job_id']}",
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 if result.ok:
                     job = result.json()
                     st.session_state.last_content = job.get("content", "")
-                    st.session_state.last_job_id = selected["job_id"]
+                    st.session_state.last_job_id = blog["job_id"]
                     st.session_state.last_plan = job.get("plan")
                     st.session_state.last_evidence = job.get("evidence", [])
                     st.rerun()
                 else:
                     show_error(result)
 
-        st.divider()
-        if st.button("Log out", use_container_width=True):
-            for key in ("token", "refresh_token", "last_content", "last_job_id", "last_plan", "last_evidence", "last_timestamps"):
-                st.session_state.pop(key, None)
-            st.rerun()
+    st.divider()
+    username = st.session_state.get("username") or "writer"
+    st.markdown(f'<div class="user-chip">👤&nbsp; {username}</div>', unsafe_allow_html=True)
+    if st.button("Log out", icon=":material/logout:", key="logout", use_container_width=True):
+        for key in ("token", "refresh_token", "username", "last_content", "last_job_id",
+                    "last_plan", "last_evidence", "last_timestamps"):
+            st.session_state.pop(key, None)
+        st.rerun()
+    status = "🟢 backend online" if health else "🔴 backend offline"
+    st.caption(f"{status} · {API_BASE_URL}")
 
+
+def composer() -> None:
+    """Claude/ChatGPT-style prompt box with an inline model picker."""
+    if not st.session_state.get("last_content"):
+        st.markdown(
+            '<p class="main-title">What should we write about?</p>'
+            '<p class="main-sub">Give a topic, pick a model, and the research-to-article pipeline handles the rest.</p>',
+            unsafe_allow_html=True,
+        )
+    with st.container(border=True):
+        topic = st.text_area(
+            "Topic",
+            label_visibility="collapsed",
+            placeholder="e.g. How should production RAG systems be evaluated?",
+            height=128,
+            key="composer_topic",
+        )
+        cols = st.columns([1.5, 1, 1])
+        options = ["Auto (fallback chain)"] + list(st.session_state.get("_model_options") or [])
+        current = st.session_state.get("model_choice") or options[0]
+        if current not in options:
+            current = options[0]
+        with cols[0]:
+            with st.popover(f"✦ Model · {current.replace('gemini/', '')}", use_container_width=True):
+                st.caption(
+                    "The model that drafts and reviews your article. If its quota runs out, "
+                    "the fallback chain takes over automatically."
+                )
+                st.radio("Model", options, key="model_choice", label_visibility="collapsed")
+        with cols[1]:
+            as_of = st.date_input(
+                "As-of date",
+                value=None,
+                help="Optional. Limits web research to this date or earlier.",
+            )
+        with cols[2]:
+            submitted = st.button("Generate", icon=":material/send:", type="primary", use_container_width=True)
     if submitted:
-        if not topic.strip():
-            st.warning("Please enter a topic.")
-            return
-        payload = {
-            "topic": topic.strip(),
-            "preferred_model": None if model_choice == "(fallback chain)" else model_choice,
-        }
-        if as_of is not None:
-            payload["as_of"] = as_of.isoformat()
-        response = api_request("POST", "/api/v1/generate", headers={"Authorization": f"Bearer {token}"}, json=payload)
-        if not response.ok:
-            show_error(response)
-            return
-        job_id = response.json()["job_id"]
-        progress = st.progress(0, text="Starting workflow...")
-        status_box = st.status("Running graph...", expanded=True)
-        stages = ["router", "research", "planner", "workers", "quality gate", "images"]
-        shown_stages: set[str] = set()
-        for attempt in range(60):
-            time.sleep(2)
-            result = api_request("GET", f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"})
-            if not result.ok:
-                progress.empty()
-                show_error(result)
-                return
-            job = result.json()
-            if job["status"] == "completed":
-                st.session_state.last_content = job.get("content", "")
-                st.session_state.last_job_id = job_id
-                st.session_state.last_plan = job.get("plan")
-                st.session_state.last_evidence = job.get("evidence", [])
-                st.session_state.last_timestamps = (job.get("created_at"), job.get("updated_at"))
-                progress.progress(100, text="Article ready")
-                status_box.update(label="Done", state="complete", expanded=False)
-                break
-            if job["status"] == "failed":
-                progress.empty()
-                status_box.update(label="Generation failed", state="error", expanded=True)
-                st.error(job.get("error") or "Article generation failed.")
-                return
-            # Real workflow stage reported by the backend (falls back to a heuristic).
-            stage = job.get("stage") or stages[min(len(stages) - 1, attempt // 10)]
-            if stage not in shown_stages:
-                status_box.write(f"Stage: `{stage}`")
-                shown_stages.add(stage)
-            progress.progress(min(95, (attempt + 1) * 95 // 60), text=f"Job status: {job['status']} | {stage}")
-        else:
+        run_generation((topic or "").strip(), as_of, current)
+
+def run_generation(topic: str, as_of, model_choice: str) -> None:
+    """Submit the job and poll until the article is ready (same contract as before)."""
+    token = st.session_state.get("token")
+    if not topic:
+        st.warning("Please enter a topic first.")
+        return
+    payload = {
+        "topic": topic,
+        "preferred_model": None if model_choice.startswith("Auto") else model_choice,
+    }
+    if as_of is not None:
+        payload["as_of"] = as_of.isoformat()
+    response = api_request("POST", "/api/v1/generate", headers={"Authorization": f"Bearer {token}"}, json=payload)
+    if not response.ok:
+        show_error(response)
+        return
+    job_id = response.json()["job_id"]
+    progress = st.progress(0, text="Starting workflow...")
+    status_box = st.status("Running the pipeline...", expanded=True)
+    stages = ["router", "research", "planner", "workers", "quality gate", "images"]
+    shown: set[str] = set()
+    for attempt in range(60):
+        time.sleep(2)
+        result = api_request("GET", f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"})
+        if not result.ok:
             progress.empty()
-            st.warning(f"The job is still running. Job ID: {job_id}")
+            show_error(result)
+            return
+        job = result.json()
+        if job["status"] == "completed":
+            st.session_state.last_content = job.get("content", "")
+            st.session_state.last_job_id = job_id
+            st.session_state.last_plan = job.get("plan")
+            st.session_state.last_evidence = job.get("evidence", [])
+            st.session_state.last_timestamps = (job.get("created_at"), job.get("updated_at"))
+            progress.progress(100, text="Article ready")
+            status_box.update(label="Done", state="complete", expanded=False)
+            st.rerun()
+        if job["status"] == "failed":
+            progress.empty()
+            status_box.update(label="Generation failed", state="error", expanded=True)
+            st.error(job.get("error") or "Article generation failed.")
+            return
+        # Real workflow stage reported by the backend (falls back to a heuristic).
+        stage = job.get("stage") or stages[min(len(stages) - 1, attempt // 10)]
+        if stage not in shown:
+            status_box.write(f"Stage: `{stage}`")
+            shown.add(stage)
+        progress.progress(min(95, (attempt + 1) * 95 // 60), text=f"{job['status']} · {stage}")
+    else:
+        progress.empty()
+        st.warning(f"Still running. Job ID: {job_id}")
+
+def article_view() -> None:
+    """Rendered article with plan/evidence/preview/images/logs tabs."""
+    import html as html_mod
 
     markdown = st.session_state.get("last_content", "")
     if not markdown:
-        st.info("Enter a topic and click Generate Blog.")
         return
-
     title = extract_title(markdown)
-    plan_tab, evidence_tab, preview_tab, images_tab, logs_tab = st.tabs(["Plan", "Evidence", "Markdown Preview", "Images", "Logs"])
+    st.markdown(f'<p class="article-title">{html_mod.escape(title)}</p>', unsafe_allow_html=True)
+    created, updated = st.session_state.get("last_timestamps", (None, None))
+    chips = (
+        '<span class="meta-chip">✅ completed</span>'
+        f'<span class="meta-chip">job {str(st.session_state.get("last_job_id"))[:8]}</span>'
+    )
+    if created:
+        chips += f'<span class="meta-chip">created {str(created)[:10]}</span>'
+    if updated:
+        chips += f'<span class="meta-chip">updated {str(updated)[:10]}</span>'
+    st.markdown(chips, unsafe_allow_html=True)
+    st.write("")
+
+    plan_tab, evidence_tab, preview_tab, images_tab, logs_tab = st.tabs(
+        ["Plan", "Evidence", "Markdown Preview", "Images", "Logs"]
+    )
     with plan_tab:
-        st.subheader("Plan")
         plan = normalize_plan(st.session_state.get("last_plan"))
         if plan:
             st.write("**Title:**", plan.get("blog_title", title))
@@ -360,7 +568,6 @@ def authenticated_workspace() -> None:
             st.info("Plan metadata is available for blogs generated after the backend update.")
         st.caption(f"Job: {st.session_state.get('last_job_id')} | Status: completed")
     with evidence_tab:
-        st.subheader("Evidence")
         evidence = st.session_state.get("last_evidence") or extract_evidence(markdown)
         if evidence:
             st.dataframe(
@@ -379,19 +586,21 @@ def authenticated_workspace() -> None:
         else:
             st.info("No citations were included in this article. Closed-book topics may not require web evidence.")
     with preview_tab:
-        st.subheader("Markdown Preview")
         render_markdown(markdown)
         st.download_button("Download Markdown", markdown.encode("utf-8"), f"{safe_slug(title)}.md", "text/markdown")
-        st.download_button("Download Bundle (MD + images)", bundle_bytes(markdown, title), f"{safe_slug(title)}_bundle.zip", "application/zip")
+        st.download_button(
+            "Download Bundle (MD + images)",
+            bundle_bytes(markdown, title),
+            f"{safe_slug(title)}_bundle.zip",
+            "application/zip",
+        )
     with images_tab:
-        st.subheader("Images")
         sources = [image_url(match.group("src")) for match in IMAGE_RE.finditer(markdown)]
         if not sources:
             st.info("No images were generated for this article.")
         for source in sources:
             st.image(source, use_container_width=True)
     with logs_tab:
-        st.subheader("Logs")
         st.code(
             f"API: {API_BASE_URL}\nJob: {st.session_state.get('last_job_id')}\n"
             f"Status: completed\nEvidence found: {len(st.session_state.get('last_evidence') or extract_evidence(markdown))}\n"
@@ -400,8 +609,12 @@ def authenticated_workspace() -> None:
             f"Updated: {st.session_state.get('last_timestamps', (None, None))[1]}"
         )
 
+# -----------------------------
+# App flow
+# -----------------------------
+if st.session_state.pop("signup_done", False):
+    st.toast("Welcome! Your account is ready — you're signed in.", icon="✦")
 
-st.markdown('<div class="hero"><h1>Agentic Content Orchestrator</h1><p>Research, draft, review, and export your article.</p></div>', unsafe_allow_html=True)
 try:
     health_response = api_request("GET", "/api/v1/health")
     health = health_response.json() if health_response.ok else None
@@ -416,24 +629,17 @@ if "_model_options" not in st.session_state:
     except requests.RequestException:
         st.session_state._model_options = []
 
-with st.sidebar:
-    st.subheader("Connection")
-    st.code(API_BASE_URL)
-    if health:
-        st.success("Backend online")
-        st.caption(f"JWT configured: {health.get('jwt_configured', False)}")
-        st.caption(f"Redis ready: {health.get('redis_ready', False)}")
-        st.caption(f"Images enabled: {health.get('images_enabled', False)}")
-        if st.session_state._model_options:
-            st.caption(f"Models: {', '.join(st.session_state._model_options[:2])}")
-    else:
-        st.error("Backend offline")
-
 if st.session_state.get("token"):
-    authenticated_workspace()
+    with st.sidebar:
+        history_rail(health)
+    composer()
+    article_view()
 else:
-    signup_tab, login_tab = st.tabs(["Create account", "Login"])
-    with signup_tab:
-        signup_panel()
-    with login_tab:
-        login_panel()
+    auth_screen()
+
+
+
+
+
+
+
