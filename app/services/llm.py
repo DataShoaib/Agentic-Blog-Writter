@@ -11,7 +11,14 @@ from app.config import APP_CONFIG, get_secrets
 
 logger = logging.getLogger(__name__)
 
-TEXT_OUTPUT_TOKENS, STRUCTURED_OUTPUT_TOKENS = 1300, 3400
+TEXT_OUTPUT_TOKENS, STRUCTURED_OUTPUT_TOKENS = 3000, 3400
+
+# Full-article revision must re-emit EVERY planned section (often 2500-4500
+# words). Capping it at TEXT_OUTPUT_TOKENS (~1300 tokens) truncates the
+# article mid-sentence and silently drops trailing sections — exactly the
+# "plan has 7 sections but final blog has 3" bug. This budget is only used
+# for whole-article rewrites, never for single-section workers.
+REVISION_OUTPUT_TOKENS = 12000
 
 # Structured output is the only sanctioned way to get data out of the LLM:
 # every caller passes a pydantic schema (or plain dict) and receives a
@@ -107,7 +114,7 @@ def _to_messages(messages: list[Any]) -> list[dict[str, str]]:
     return [{"role": str(message.get("role", "user")), "content": str(message.get("content", ""))} if isinstance(message, dict) else {"role": roles.get(getattr(message, "type", "user"), "user"), "content": str(message.content)} for message in messages]
 
 
-def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model: str | None = None, max_tokens: int, response_format: type[BaseModel] | None = None) -> Any:
+def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model: str | None = None, max_tokens: int, response_format: type[BaseModel] | None = None, temperature: float = 0) -> Any:
     candidates = model_candidates()
 
     # Ordered try-list: the user's preferred model first, then every other
@@ -120,7 +127,7 @@ def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model
 
     last_exc: Exception | None = None
     for index, model in enumerate(ordered):
-        kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
+        kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         if response_format:
             kwargs["response_format"] = response_format
         try:
@@ -278,8 +285,8 @@ def _repair_json(text: str) -> str:
     return "".join(out)
 
 
-def invoke_text(messages: list[Any], *, operation: str, preferred_model: str | None = None) -> str:
-    return _content(_complete(_to_messages(messages), operation=operation, preferred_model=preferred_model, max_tokens=TEXT_OUTPUT_TOKENS))
+def invoke_text(messages: list[Any], *, operation: str, preferred_model: str | None = None, max_tokens: int | None = None, temperature: float = 0.7) -> str:
+    return _content(_complete(_to_messages(messages), operation=operation, preferred_model=preferred_model, max_tokens=max_tokens if max_tokens is not None else TEXT_OUTPUT_TOKENS, temperature=temperature))
 
 
 def invoke_structured(
