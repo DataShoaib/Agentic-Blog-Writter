@@ -14,7 +14,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
 IMAGES_DIR = Path("images")
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 
-st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✨", layout="wide")
+st.set_page_config(page_title="Agentic Content Orchestrator", page_icon="✨", layout="centered")
 
 THEME_CSS = """
 <style>
@@ -33,7 +33,17 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer
 }
 [data-testid="stHeader"] { background: transparent; }
 #MainMenu, footer { visibility: hidden; }
-.block-container { padding-top: 2.2rem; padding-bottom: 4rem; max-width: 62rem; }
+/* ---------- page rhythm: one centered column, generous air ---------- */
+.block-container {
+    padding-top: 2.4rem !important;
+    padding-bottom: 4rem !important;
+    max-width: 880px !important;
+}
+.block-container > div > [data-testid="stVerticalBlock"] { width: 100%; }
+[data-testid="stVerticalBlock"] { row-gap: .9rem; }
+[data-testid="stHorizontalBlock"] { column-gap: .75rem; align-items: stretch; }
+
+/* Main-area headers + eyebrow live in MORE_CSS (single source of truth). */
 
 /* ---------- sidebar: dark history rail ---------- */
 [data-testid="stSidebar"] {
@@ -84,8 +94,8 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer
 [data-testid="stVerticalBlockBorderWrapper"] {
     background: #ffffff;
     border: 1px solid #e7eaf3 !important;
-    border-radius: 20px;
-    box-shadow: 0 10px 34px rgba(23,28,63,.07);
+    border-radius: 16px;
+    box-shadow: 0 8px 24px rgba(23,28,63,.06);
 }
 </style>
 """
@@ -93,28 +103,38 @@ st.markdown(THEME_CSS, unsafe_allow_html=True)
 
 MORE_CSS = """
 <style>
-/* ---------- typography ---------- */
-.main-title { font-size: 2.15rem; font-weight: 800; color: #141a33; letter-spacing: -.02em; margin: 0 0 .2rem; }
-.main-sub { color: #626b85; font-size: .98rem; margin: 0 0 1.1rem; }
-.auth-title { font-size: 1.35rem; font-weight: 800; color: #141a33; margin: .1rem 0 .15rem; text-align: center; }
-.auth-sub { color: #626b85; font-size: .86rem; margin: 0 0 1rem; text-align: center; }
+/* ---------- typography: single source of truth ---------- */
+.eyebrow {
+    display: block; font-size: .72rem !important; font-weight: 700 !important;
+    letter-spacing: .12em !important; text-transform: uppercase;
+    color: #6d5cf0 !important; margin: 0 0 .45rem !important; text-align: left !important; line-height: 1.4 !important;
+}
+.main-title { font-size: 2.15rem !important; font-weight: 800 !important; color: #141a33 !important; letter-spacing: -.02em; margin: 0 0 .3rem !important; text-align: left !important; line-height: 1.15 !important; }
+.main-sub { color: #626b85 !important; font-size: .98rem !important; line-height: 1.6 !important; margin: 0 0 1.3rem !important; text-align: left !important; }
+.article-title { font-size: 1.45rem !important; font-weight: 800 !important; color: #141a33 !important; letter-spacing: -.01em; margin: 0 !important; text-align: left !important; line-height: 1.25 !important; }
+.meta-row { margin: .45rem 0 0 !important; text-align: left !important; }
+.meta-chip {
+    display: inline-block; background: #eef0f9; color: #4d566f !important;
+    border-radius: 999px; padding: .18rem .65rem; font-size: .74rem !important; font-weight: 600 !important; margin-right: .4rem;
+}
+
+/* ---------- auth card ---------- */
+.auth-card { padding: 1.8rem 1.8rem 1.6rem !important; }
+.auth-kicker {
+    font-size: .78rem !important; font-weight: 700 !important;
+    letter-spacing: .12em !important; text-transform: uppercase;
+    color: #6d5cf0 !important; text-align: center !important;
+    margin-bottom: .75rem !important; line-height: 1.3 !important;
+}
+.auth-title { font-size: 1.35rem !important; font-weight: 800 !important; color: #141a33 !important; margin: .1rem 0 .15rem !important; text-align: center !important; line-height: 1.3 !important; }
+.auth-sub { color: #626b85 !important; font-size: .9rem !important; margin: 0 0 1rem !important; text-align: center !important; line-height: 1.5 !important; }
 .auth-badge {
-    width: 46px; height: 46px; border-radius: 14px; margin: .2rem auto .8rem;
+    width: 48px; height: 48px; border-radius: 14px; margin: .3rem auto .8rem;
     display: flex; align-items: center; justify-content: center;
     background: linear-gradient(135deg, #4f46e5, #8b5cf6);
     color: #fff !important; font-size: 1.3rem; font-weight: 800;
 }
-.article-title { font-size: 1.45rem; font-weight: 800; color: #141a33; letter-spacing: -.01em; margin: 0; }
-.meta-chip {
-    display: inline-block; background: #eef0f9; color: #4d566f !important;
-    border-radius: 999px; padding: .18rem .65rem; font-size: .74rem; font-weight: 600; margin-right: .4rem;
-}
-
-/* ---------- auth card: wider + roomier ---------- */
-[data-testid="stVerticalBlockBorderWrapper"] > div:has(.auth-badge) {
-    padding: 2.2rem 2.6rem 2rem !important;
-}
-.auth-form-row { min-height: 3.1rem; }
+.auth-form-row { min-height: 3.1rem; padding: 0.78rem 1rem; }
 [data-testid="stVerticalBlockBorderWrapper"]:has(.auth-badge) [data-testid="stTextInput"] input {
     padding: .78rem 1rem !important; font-size: .95rem !important;
 }
@@ -128,7 +148,7 @@ MORE_CSS = """
 /* ---------- inputs ---------- */
 [data-testid="stTextArea"] textarea {
     border-radius: 14px !important; border: 1.5px solid #e3e7f2 !important;
-    background: #fbfcff !important; color: #1c2340 !important; font-size: .95rem;
+    background: #fbfcff !important; color: #1c2340 !important; font-size: .95rem !important;
     padding: .8rem .9rem !important; transition: border .15s ease, box-shadow .15s ease;
 }
 [data-testid="stTextArea"] textarea:focus {
@@ -138,7 +158,7 @@ MORE_CSS = """
 
 [data-testid="stTextInput"] input {
     border-radius: 12px !important; border: 1.5px solid #e3e7f2 !important;
-    background: #fbfcff !important; color: #1c2340 !important;
+    background: #fbfcff !important; color: #1c2340 !important; font-size: .95rem !important;
 }
 [data-testid="stTextInput"] input:focus {
     border-color: #6d5cf0 !important; box-shadow: 0 0 0 3px rgba(109,92,240,.15) !important;
@@ -180,8 +200,8 @@ MORE_CSS = """
     gap: 5px; background: #edeff7; padding: 4px; border-radius: 13px;
 }
 [data-testid="stTabs"] [data-baseweb="tab"] {
-    border-radius: 10px !important; color: #5b6480 !important; font-weight: 600;
-    font-size: .88rem; background: transparent; border: none !important;
+    border-radius: 10px !important; color: #5b6480 !important; font-weight: 600 !important;
+    font-size: .88rem !important; background: transparent; border: none !important;
 }
 [data-testid="stTabs"] [aria-selected="true"] {
     background: #ffffff !important; color: #141a33 !important;
@@ -358,20 +378,24 @@ def login_panel() -> None:
 
 def auth_screen() -> None:
     """Modern centered auth card (Claude/Notion style)."""
-    _, mid, _ = st.columns([1, 1.9, 1], gap="large")
-    with mid:
-        with st.container(border=True):
-            st.markdown('<div class="auth-badge">✦</div>', unsafe_allow_html=True)
-            st.markdown('<p class="auth-title">Welcome to Agentic Writer</p>', unsafe_allow_html=True)
-            st.markdown(
-                '<p class="auth-sub">Research, draft and polish long-form articles — in one place.</p>',
-                unsafe_allow_html=True,
-            )
-            tab_login, tab_signup = st.tabs(["Log in", "Create account"])
-            with tab_login:
-                login_panel()
-            with tab_signup:
-                signup_panel()
+    _, mid, _ = st.columns([1, 4, 1], gap="large")
+    # auth card
+    with mid.container(border=True, height=420):
+        st.markdown(
+            '<p class="auth-kicker">Agentic Content Orchestrator</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="auth-badge">✦</div>', unsafe_allow_html=True)
+        st.markdown('<p class="auth-title">Welcome to Agentic Writer</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="auth-sub">Research, draft and polish long-form articles — in one place.</p>',
+            unsafe_allow_html=True,
+        )
+        tab_login, tab_signup = st.tabs(["Log in", "Create account"])
+        with tab_login:
+            login_panel()
+        with tab_signup:
+            signup_panel()
 
 def history_rail(health: dict | None) -> None:
     """ChatGPT-style sidebar: brand, new-blog button, clickable history, user chip."""
@@ -451,7 +475,7 @@ def composer() -> None:
             height=128,
             key="composer_topic",
         )
-        cols = st.columns([1.5, 1, 1])
+        cols = st.columns([1.5, 1, 1], vertical_alignment="center")
         options = ["Auto (fallback chain)"] + list(st.session_state.get("_model_options") or [])
         current = st.session_state.get("model_choice") or options[0]
         if current not in options:
