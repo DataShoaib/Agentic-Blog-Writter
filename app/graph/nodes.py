@@ -23,6 +23,8 @@ from app.services.citations import validate_citations
 from app.services.images import generate_image
 from app.services.llm import (
     LLMGatewayError,
+    REVISION_OUTPUT_TOKENS,
+    TEXT_OUTPUT_TOKENS,
     invoke_structured,
     invoke_text,
     model_candidates,
@@ -150,6 +152,14 @@ def planner_node(state: GraphState) -> dict:
 
     if forced_kind:
         plan.blog_kind = "news_roundup"
+    # Hard floor: the planner sometimes emits thin 120-200 word sections even
+    # when told not to. Clamp every task to >=280 words here so workers always
+    # get a deep budget and the quality gate's per-section check can pass on
+    # the first attempt. Never silently keep a shallow plan.
+    for _t in plan.tasks:
+        if _t.target_words < 280:
+            logger.warning("planner task %d thin budget (%d) - clamped to 280", _t.id, _t.target_words)
+            _t.target_words = 280
     total_words = sum(task.target_words for task in plan.tasks)
     logger.info(
         "planner tasks=%d total_target_words=%d title=%s",
@@ -209,10 +219,16 @@ def worker_node(payload: dict) -> dict:
     )
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
-    evidence_text = "\n".join(
-        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
-        for e in evidence[:20]
-    )
+    evidence_lines = []
+    for e in evidence[:20]:
+        snippet = (e.snippet or "").strip().replace("\n", " ")
+        if len(snippet) > 320:
+            snippet = snippet[:320].rstrip() + "…"
+        evidence_lines.append(
+            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
+            + (f" | {snippet}" if snippet else "")
+        )
+    evidence_text = "\n".join(evidence_lines) or "(no evidence — write evergreen content, do not invent sources)"
 
     section = invoke_text(
         [
@@ -230,7 +246,7 @@ def worker_node(payload: dict) -> dict:
                     f"{memory_block}\n"
                     f"Section title: {task.title}\n"
                     f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
+                    f"Target words: {task.target_words} (MINIMUM {task.target_words} words — hitting this floor matters more than staying concise)\n"
                     f"Tags: {task.tags}\n"
                     f"requires_research: {task.requires_research}\n"
                     f"requires_citations: {task.requires_citations}\n"
@@ -242,8 +258,50 @@ def worker_node(payload: dict) -> dict:
         ],
         operation=f"worker_{task.id}",
         preferred_model=preferred,
+        # 380 target words ≈ 500 tokens, but padding (bullets, citations,
+        # formatting) plus model verbosity needs headroom: target_words * 4
+        # tokens/word heuristic, floored so even small sections can't clip.
+        max_tokens=max(TEXT_OUTPUT_TOKENS, int(task.target_words * 4)),
     )
-    logger.info("worker_%d used preferred model %s (%d chars)", task.id, preferred, len(section))
+    words = _word_count(section)
+    paras = _substantial_paragraphs(section)
+    logger.info(
+        "worker_%d target=%d words=%d paras=%d used preferred model %s (%d chars)",
+        task.id, task.target_words, words, paras, preferred, len(section),
+    )
+    # Retry when the section is short OR shallow: a 250-word two-paragraph
+    # stub hits the word floor but still reads like an AI summary. The
+    # quality gate enforces the same rule deterministically, so repair here.
+    if words < 0.85 * task.target_words or words < 250 or paras < 2:
+        logger.warning(
+            "worker_%d short (%d/%d words) — retrying with explicit expansion ask",
+            task.id, words, task.target_words,
+        )
+        section = invoke_text(
+            [
+                SystemMessage(content=WORKER_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Your previous draft was only {words} words vs the required "
+                        f"minimum {task.target_words}. EXPAND it now: keep the same "
+                        f"'## {task.title}' heading, deepen every bullet with "
+                        f"mechanisms, trade-offs, pitfalls and concrete examples, "
+                        f"and add comparison tables or annotated code where the "
+                        f"bullets allow it. Output only the expanded section.\n\n"
+                        f"Previous draft:\n{section}\n\n"
+                        f"Bullets:{bullets_text}\n\n"
+                        f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
+                    )
+                ),
+            ],
+            operation=f"worker_{task.id}_expand",
+            preferred_model=preferred,
+            max_tokens=max(TEXT_OUTPUT_TOKENS, int(task.target_words * 4)),
+        )
+        logger.info(
+            "worker_%d expanded retry words=%d (target=%d)",
+            task.id, _word_count(section), task.target_words,
+        )
     return {"sections": [(task.id, section)]}
 
 
@@ -256,12 +314,80 @@ def merge_content(state: GraphState) -> dict:
     if not sections:
         raise ValueError("Workers produced no sections.")
 
+    # Guard against silent section loss: every planned task must have exactly
+    # one worker output. LangSmith showed all workers succeeding yet the final
+    # blog missing sections — a dropped/duplicate write here would do that.
+    planned_ids = [task.id for task in plan.tasks]
+    got_ids = [task_id for task_id, _ in sections]
+    missing = [tid for tid in planned_ids if tid not in got_ids]
+    if missing:
+        raise ValueError(
+            f"Workers missing sections for planned tasks {missing} "
+            f"(planned={planned_ids} got={got_ids})."
+        )
+    if len(set(got_ids)) != len(got_ids):
+        raise ValueError(f"Duplicate worker outputs for tasks: {got_ids}.")
+
     body = "\n\n".join(markdown for _, markdown in sections).strip()
-    return {"merged_md": f"# {plan.blog_title}\n\n{body}\n"}
+    # Repair: re-split CONCATENATED body on planned headings.
+    # A worker echoing a sibling heading would otherwise overwrite it.
+    _body_all = body
+    _by_id: dict[int, str] = {}
+    for _task in plan.tasks:
+        _pat = re.compile(
+            r"^##\s+" + re.escape(_task.title.strip()) + r"\s*$",
+            re.MULTILINE,
+        )
+        _mm = list(_pat.finditer(_body_all))
+        if _mm:
+            _st = _mm[0].start()
+            _fol = [
+                m2.start()
+                for _t2 in plan.tasks
+                if _t2.id != _task.id
+                for m2 in re.finditer(
+                    r"^##\s+" + re.escape(_t2.title.strip()) + r"\s*$",
+                    _body_all[_st:],
+                    re.MULTILINE,
+                )
+            ]
+            _en = _st + min(_fol) if _fol else len(_body_all)
+            _by_id[_task.id] = _body_all[_st:_en].strip()
+    for _tid, _md in sections:
+        _by_id.setdefault(_tid, _md)
+    if len(_by_id) == len(planned_ids):
+        _ordered = [_by_id[tid] for tid in planned_ids]
+        _rebody = "\n\n".join(_ordered).strip()
+        if _rebody:
+            body = _rebody
+    merged = f"# {plan.blog_title}\n\n{body}\n"
+    per_section_words = {task_id: _word_count(markdown) for task_id, markdown in sections}
+    targets = {task.id: task.target_words for task in plan.tasks}
+    thin = [
+        f"task={tid} words={per_section_words.get(tid, 0)}/{targets.get(tid, '?')}"
+        for tid in planned_ids
+        if per_section_words.get(tid, 0) < 0.85 * targets.get(tid, 1)
+    ]
+    logger.info(
+        "merge tasks=%d sections=%d merged_chars=%d merged_words=%d%s",
+        len(planned_ids), len(sections), len(merged), _word_count(merged),
+        f" thin=[{', '.join(thin)}]" if thin else "",
+    )
+    return {"merged_md": merged}
 
 
 def _word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text))
+
+
+def _substantial_paragraphs(section_md: str) -> int:
+    """Count body paragraphs with >=40 words (headings excluded).
+
+    Shared by the worker retry trigger, merge repair and the quality gate so
+    a two-line stub can never pass as a finished section anywhere.
+    """
+    body = re.sub(r"^#{1,6}\s+.*$", "", section_md or "", flags=re.MULTILINE)
+    return sum(1 for p in re.split(r"\n\s*\n", body) if len(re.findall(r"\b\w+\b", p)) >= 40)
 
 
 def quality_gate(state: GraphState) -> dict:
@@ -307,18 +433,68 @@ def quality_gate(state: GraphState) -> dict:
         state["merged_md"], evidence, citations_required=citations_required
     )
     issues = list(dict.fromkeys([*result.issues, *citation_issues]))[:12]
+    # Cap don't crush: one stray unapproved URL shouldn't nuke an otherwise
+    # cited article to near-zero. Floor at 0.6 when at least one approved
+    # citation exists; only a total absence fails the gate.
+    from app.services.citations import approved_urls, citation_urls as _cited_urls
+
+    _approved = approved_urls(evidence)
+    _cited = _cited_urls(state["merged_md"])
+    if _cited & _approved:
+        citation_score = max(citation_score, 0.6)
     result.citation_score = min(result.citation_score, citation_score)
 
     # Hard length enforcement: a thin article must fail and trigger revision.
+    # Threshold 0.85 (with an 85-90% warn band) so one slightly-short section
+    # out of 7 doesn't condemn the whole run; per-section word logging in
+    # merge_content identifies the real culprit.
+    # Deterministic per-section depth: every planned section body
+    # must be >=200 words with >=2 substantial paragraphs.
+    _bodies: dict[int, str] = {}
+    for _task in plan.tasks:
+        _pat = re.compile(
+            r"^##\s+" + re.escape(_task.title.strip()) + r"\s*$",
+            re.MULTILINE,
+        )
+        _mm = list(_pat.finditer(state["merged_md"]))
+        if _mm:
+            _st = _mm[0].start()
+            _fol = [
+                m2.start()
+                for _t2 in plan.tasks
+                if _t2.id != _task.id
+                for m2 in re.finditer(
+                    r"^##\s+" + re.escape(_t2.title.strip()) + r"\s*$",
+                    state["merged_md"][_st:],
+                    re.MULTILINE,
+                )
+            ]
+            _en = _st + min(_fol) if _fol else len(state["merged_md"])
+            _bodies[_task.id] = state["merged_md"][_st:_en]
+    for _task in plan.tasks:
+        _w = _word_count(_bodies.get(_task.id, ""))
+        _pp = _substantial_paragraphs(_bodies.get(_task.id, ""))
+        if _w < 200 or _pp < 2:
+            issues.append(
+                f"Section '{_task.title}' too thin: {_w} words, {_pp} substantial "
+                "paragraphs (need >=200 words and >=2 paragraphs of >=40 words). "
+                "Expand with mechanisms, trade-offs, examples, tables or code."
+            )
+            result.completeness_score = min(result.completeness_score, 0.5)
     planned_words = sum(task.target_words for task in plan.tasks)
     actual_words = _word_count(state["merged_md"])
-    if actual_words < 0.9 * planned_words:
+    if actual_words < 0.85 * planned_words:
         issues.append(
             f"Article too short: {actual_words} words vs planned {planned_words}. "
             "Expand thin sections with deeper explanations, examples, tables, or code."
         )
         result.completeness_score = min(result.completeness_score, 0.5)
         result.factuality_score = min(result.factuality_score, 0.85)
+    elif actual_words < 0.9 * planned_words:
+        issues.append(
+            f"Article slightly short: {actual_words} words vs planned {planned_words} "
+            "(within tolerance — consider expanding the thinnest section)."
+        )
     logger.info(
         "quality gate words=%d planned=%d scores(f=%s,c=%s,cit=%s) issues=%d",
         actual_words, planned_words,
@@ -352,26 +528,138 @@ def route_quality(state: GraphState) -> str:
     return "images"
 
 
+def _targeted_expand(state: GraphState, plan: Plan, thin_titles: list[str]) -> str | None:
+    """Expand ONLY thin sections, splice back, keep good ones byte-for-byte."""
+    try:
+        thin = [t for t in plan.tasks if t.title in thin_titles]
+        bullets = "\n".join(f"- {t.title}: " + "; ".join(t.bullets) for t in thin)
+        expanded = invoke_text(
+            [
+                SystemMessage(content=WORKER_SYSTEM),
+                HumanMessage(
+                    content=(
+                        "Expand ONLY the sections listed below. For EACH, output "
+                        "a '## <exact title>' block of at least 300 words with "
+                        "2+ substantial paragraphs (mechanisms, trade-offs, "
+                        "concrete examples, pitfalls). Keep titles EXACT. "
+                        "Output only the expanded section blocks.\n\n"
+                        f"Sections to expand:\n{bullets}"
+                    )
+                ),
+            ],
+            operation="revision_targeted",
+            preferred_model=state.get("model"),
+            max_tokens=max(REVISION_OUTPUT_TOKENS // 2, 6000),
+        )
+        spliced = _splice_sections(state["merged_md"], list(plan.tasks), expanded)
+        res = quality_gate({**state, "merged_md": spliced})
+        if res["quality"]["passed"]:
+            logger.info("targeted revision fixed %s", thin_titles)
+            return spliced
+        logger.info("targeted revision insufficient; full rewrite next")
+    except Exception as exc:
+        logger.warning("targeted revision failed (%s); full rewrite next", exc)
+    return None
+
+
+def _splice_sections(merged_md: str, tasks: list, expanded_md: str) -> str:
+    """Replace named thin section bodies with expanded blocks."""
+    out = merged_md
+    for task in tasks:
+        pat = re.compile(
+            r"^##\s+" + re.escape(task.title.strip()) + r"\s*$",
+            re.MULTILINE,
+        )
+        new_m = list(pat.finditer(expanded_md))
+        if not new_m:
+            continue
+        new_start = new_m[0].start()
+        new_fol = [
+            m2.start()
+            for t2 in tasks
+            if t2.id != task.id
+            for m2 in re.finditer(
+                r"^##\s+" + re.escape(t2.title.strip()) + r"\s*$",
+                expanded_md[new_start:],
+                re.MULTILINE,
+            )
+        ]
+        new_end = new_start + min(new_fol) if new_fol else len(expanded_md)
+        new_block = expanded_md[new_start:new_end].strip()
+        if _word_count(new_block) < 200:
+            continue
+        old_m = list(pat.finditer(out))
+        if not old_m:
+            continue
+        old_start = old_m[0].start()
+        old_fol = [
+            m2.start()
+            for t2 in tasks
+            if t2.id != task.id
+            for m2 in re.finditer(
+                r"^##\s+" + re.escape(t2.title.strip()) + r"\s*$",
+                out[old_start:],
+                re.MULTILINE,
+            )
+        ]
+        old_end = old_start + min(old_fol) if old_fol else len(out)
+        out = (out[:old_start] + new_block + out[old_end:]).strip() + "\n"
+    return out
+
+
 def revise_content(state: GraphState) -> dict:
     plan = state.get("plan")
     if plan is None:
         raise ValueError("Revision requires a plan.")
 
     issues = state.get("quality", {}).get("issues", [])
-    revised = invoke_text(
-        [
-            SystemMessage(content=REVISE_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Plan: {plan.model_dump()}\n"
-                    f"Issues: {issues}\n"
-                    f"Current content:\n{state['merged_md']}"
-                )
-            ),
-        ],
-        operation="revision",
-        preferred_model=state.get("model"),
-    )
+    thin_titles = []
+    for _issue in issues:
+        for _t in plan.tasks:
+            if _t.title and _t.title in _issue and _t.title not in thin_titles:
+                thin_titles.append(_t.title)
+    if thin_titles:
+        _spliced = _targeted_expand(state, plan, thin_titles)
+        if _spliced is not None:
+            return {
+                "merged_md": _spliced,
+                "revision_count": state.get("revision_count", 0) + 1,
+            }
+    # Full-article rewrite: needs a much larger output budget than a single
+    # section, otherwise the LLM response is cut mid-article and trailing
+    # planned sections vanish from the final blog. On ANY truncation/shrink
+    # keep the pre-revision merged article instead of shipping a shorter one.
+    original = state["merged_md"]
+    try:
+        revised = invoke_text(
+            [
+                SystemMessage(content=REVISE_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Plan: {plan.model_dump()}\n"
+                        f"Issues: {issues}\n"
+                        f"Current content:\n{original}"
+                    )
+                ),
+            ],
+            operation="revision",
+            preferred_model=state.get("model"),
+            max_tokens=REVISION_OUTPUT_TOKENS,
+        )
+    except LLMGatewayError as exc:
+        # The merged article already exists; losing it to a quota error would
+        # waste the whole run. Keep the original and ship it.
+        logger.warning("revision skipped: %s", exc)
+        return {
+            "merged_md": original,
+            "revision_count": state.get("revision_count", 0) + 1,
+        }
+    if _word_count(revised) < 0.9 * _word_count(original):
+        logger.warning(
+            "revision shrank article (%d -> %d words); keeping original",
+            _word_count(original), _word_count(revised),
+        )
+        revised = original
     return {
         "merged_md": revised,
         "revision_count": state.get("revision_count", 0) + 1,
@@ -531,10 +819,9 @@ def generate_and_place_images(state: GraphState) -> dict:
                 "image generation failed for job=%s file=%s: %s: %s",
                 job_id, filename, type(exc).__name__, str(exc)[:200],
             )
-            replacement = (
-                f"> **Image unavailable:** {spec.get('caption', '')}\n>\n"
-                f"> Error: `{type(exc).__name__}`"
-            )
+            # Never leak raw provider errors into the published article — drop
+            # the placeholder and note the caption instead.
+            replacement = f"*{spec.get('caption', '')}*" if spec.get("caption") else ""
         md = md.replace(spec["placeholder"], replacement)
 
     evidence = state.get("evidence", [])
