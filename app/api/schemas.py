@@ -48,6 +48,8 @@ class GenerateResponse(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     stage: str | None = None
+    stage_detail: str | None = None
+    progress: float | None = None
     plan: dict | None = None
     evidence: list[dict] = Field(default_factory=list)
 

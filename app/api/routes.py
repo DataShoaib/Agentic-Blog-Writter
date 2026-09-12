@@ -136,6 +136,8 @@ def job(
         content=record.get("content"),
         error=record.get("error"),
         stage=record.get("stage"),
+        stage_detail=record.get("stage_detail"),
+        progress=record.get("progress"),
         plan=record.get("plan"),
         # evidence_json is NULL for queued/running jobs; the schema only
         # accepts a list, so coerce None to [] here.

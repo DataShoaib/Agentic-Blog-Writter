@@ -91,6 +91,8 @@ class JobStore:
                         content TEXT,
                         error TEXT,
                         stage TEXT,
+                        stage_detail TEXT,
+                        progress REAL,
                         plan_json TEXT,
                         evidence_json TEXT,
                         created_at TEXT NOT NULL,
@@ -101,6 +103,10 @@ class JobStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at)"
                 )
+                # Light in-place migration for rows created before stage_detail /
+                # progress existed: ADD COLUMN IF NOT EXISTS is a safe no-op.
+                conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stage_detail TEXT")
+                conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress DOUBLE PRECISION")
                 conn.commit()
             self._ready = True
 
@@ -143,6 +149,8 @@ class JobStore:
         content: str | None = None,
         error: str | None = None,
         stage: str | None = None,
+        stage_detail: str | None = None,
+        progress: float | None = None,
         plan: dict | None = None,
         evidence: list[dict] | None = None,
     ) -> None:
@@ -153,11 +161,12 @@ class JobStore:
                     """
                     UPDATE jobs
                     SET status=?, content=COALESCE(?, content), error=?, stage=COALESCE(?, stage),
+                        stage_detail=COALESCE(?, stage_detail), progress=COALESCE(?, progress),
                         plan_json=COALESCE(?, plan_json), evidence_json=COALESCE(?, evidence_json), updated_at=?
                     WHERE job_id=?
                     """
                 ),
-                (status, content, error, stage, json.dumps(plan) if plan is not None else None,
+                (status, content, error, stage, stage_detail, progress, json.dumps(plan) if plan is not None else None,
                  json.dumps(evidence) if evidence is not None else None, _utc_now(), job_id),
             )
             conn.commit()
@@ -169,7 +178,7 @@ class JobStore:
             row = conn.execute(
                 db.q(
                     """
-                    SELECT job_id,user_id,status,topic,as_of,content,error,stage,plan_json,evidence_json,created_at,updated_at
+                    SELECT job_id,user_id,status,topic,as_of,content,error,stage,stage_detail,progress,plan_json,evidence_json,created_at,updated_at
                     FROM jobs
                     WHERE job_id=? AND user_id=?
                     """
@@ -296,6 +305,8 @@ class JobManager:
                 content=cached.content,
                 error=None,
                 stage="completed",
+                stage_detail="Article ready.",
+                progress=1.0,
                 plan=cached.plan,
                 evidence=cached.evidence,
             )
@@ -336,6 +347,126 @@ class JobManager:
         return self.store.list_by_user(user_id)
 
 
+# LangGraph node -> (job stage, progress 0..1 fraction at node completion).
+# The frontend renders these as the live step checklist; the bar position is
+# the last completed fraction so it never jumps backwards on retries.
+    # Marker stages for the frontend checklist:
+    # - "queued"  -> job accepted, worker not picked it up yet
+    # - "skipped_research" -> router sent the job straight to planner
+    #   (closed-book topic); the frontend renders Research as skipped
+    #   instead of showing a fake tick for a node that never ran.
+NODE_PROGRESS: dict[str, tuple[str, float]] = {
+    "router": ("router", 0.08),
+    "research": ("research", 0.22),
+    "planner": ("planner", 0.38),
+    "worker": ("writing", 0.66),
+    "merge": ("merging", 0.72),
+    "quality": ("quality_gate", 0.80),
+    "revise": ("revising", 0.84),
+    "images": ("images", 0.92),
+    "generate_images": ("finishing", 0.98),
+}
+
+# Node -> human-readable one-liner shown under the progress bar while the next
+# node executes.
+NODE_STATUS_LABEL: dict[str, str] = {
+    "router": "Classifying topic (closed-book / hybrid / open-book)…",
+    "research": "Searching the web & building evidence…",
+    "planner": "Planning sections…",
+    "worker": "Writing sections in parallel…",
+    "merge": "Merging sections in order…",
+    "quality": "Reviewing factuality & citations…",
+    "revise": "Revising thin sections…",
+    "images": "Planning visuals…",
+    "generate_images": "Generating images & assembling final…",
+}
+
+
+def _serialize_plan(plan) -> dict | None:
+    if plan is None:
+        return None
+    if hasattr(plan, "model_dump"):
+        return plan.model_dump()
+    if isinstance(plan, dict):
+        return plan
+    return None
+
+
+def _serialize_evidence(evidence) -> list[dict]:
+    out: list[dict] = []
+    for item in evidence or []:
+        if hasattr(item, "model_dump"):
+            out.append(item.model_dump())
+        elif isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def _stream_graph_to_completion(
+    store: JobStore,
+    graph,
+    job_id: str,
+    initial_state: dict | None,
+    config: dict,
+) -> dict:
+    """Run the graph event-by-event, persisting stage after every node.
+
+    Uses ``graph.stream(..., stream_mode="updates")`` which yields one
+    ``{node_name: node_output}`` dict per completed node. After each event
+    the job row is updated so ``GET /jobs/{id}`` — and therefore the
+    frontend — shows the current node, a monotonically increasing progress
+    fraction, and any plan/evidence produced so far.
+
+    Worker fan-out emits one event per parallel section; ``stage_detail``
+    counts them (``Section 3/7``) using the plan's task count when known.
+
+    ``initial_state=None`` resumes from the last checkpoint (crash resume).
+    Returns the final full state dict.
+    """
+    store.update(job_id, status="running", stage="router", progress=0.02)
+    final_state: dict = {}
+    planned_total = 0
+
+    stream_input = None if initial_state is None else initial_state
+    for event in graph.stream(stream_input, config, stream_mode="updates"):
+        if not isinstance(event, dict):
+            continue
+        for node_name, node_output in event.items():
+            final_state = graph.get_state(config).values or final_state
+            stage, done_fraction = NODE_PROGRESS.get(node_name, ("working", 0.5))
+            plan_data = _serialize_plan(final_state.get("plan"))
+            if plan_data:
+                tasks = plan_data.get("tasks") or []
+                planned_total = len(tasks) or planned_total
+            evidence_data = _serialize_evidence(final_state.get("evidence"))
+            detail = NODE_STATUS_LABEL.get(node_name, f"{node_name}…")
+            # The router jumped straight to the planner (needs_research=False):
+            # keep stage=planner but swap the detail so the UI shows Research
+            # was skipped instead of pretending it ran.
+            if node_name == "planner" and final_state.get("needs_research") is False:
+                detail = "Research skipped (evergreen topic) — planning sections…"
+            if node_name == "worker" and planned_total:
+                done = len(final_state.get("sections") or [])
+                detail = (
+                    f"Writing sections ({min(done, planned_total)}/{planned_total})…"
+                )
+                # Sections land gradually: interpolate writing progress between
+                # the planner and merge fractions instead of sitting flat.
+                done_fraction = 0.38 + 0.28 * (min(done, planned_total) / planned_total)
+            store.update(
+                job_id,
+                status="running",
+                stage=stage,
+                stage_detail=detail,
+                progress=round(done_fraction, 3),
+                plan=plan_data,
+                evidence=evidence_data,
+            )
+
+    final_state = graph.get_state(config).values or final_state
+    return final_state
+
+
 def run_job(
     job_id: str,
     user_id: str,
@@ -370,13 +501,17 @@ def run_job(
         }
         config = {"configurable": {"thread_id": job_id}}
         # Resume from the last checkpoint if a previous attempt crashed mid-run:
-        # invoke(None) continues from the pending node with checkpointed state.
+        # stream(None) continues from the pending node with checkpointed state.
         # Otherwise (first attempt) start a fresh run with the initial state.
+        # Streaming (not invoke) so every finished node writes its stage to
+        # the job row — the frontend polls /jobs/{id} and renders live nodes.
         snapshot = graph.get_state(config)
         if snapshot.next:
-            result = graph.invoke(None, config)
+            result = _stream_graph_to_completion(store, graph, job_id, None, config)
         else:
-            result = graph.invoke(initial_state, config)
+            result = _stream_graph_to_completion(
+                store, graph, job_id, initial_state, config
+            )
         content = result.get("final", "")
         if not content:
             raise RuntimeError("Graph completed without a final document.")
@@ -394,6 +529,8 @@ def run_job(
             content=content,
             error=None,
             stage="completed",
+            stage_detail="Article ready.",
+            progress=1.0,
             plan=plan_data,
             evidence=evidence_data,
         )
