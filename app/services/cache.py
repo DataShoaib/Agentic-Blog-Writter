@@ -150,6 +150,11 @@ class CachedBlog:
 
 
 class BlogCache:
+    # Bump when article generation logic changes meaningfully: the version is
+    # part of the cache key, so pre-upgrade entries (potentially thin/truncated
+    # articles) are never served after an upgrade.
+    CACHE_VERSION = 2
+
     def __init__(self, ttl_seconds: int = BLOG_CACHE_TTL_SECONDS):
         self.ttl_seconds = ttl_seconds
         self._store = get_redis_store()
@@ -157,7 +162,7 @@ class BlogCache:
     @staticmethod
     def _cache_key(topic: str, as_of: str) -> str:
         """Universal key: identical input shares one entry across all users."""
-        raw = f"{topic.strip()}|{as_of}"
+        raw = f"v{BlogCache.CACHE_VERSION}|{topic.strip()}|{as_of}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _redis_key(self, topic: str, as_of: str) -> str:
