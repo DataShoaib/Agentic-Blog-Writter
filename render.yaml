@@ -1,0 +1,113 @@
+# Render Blueprint for the Agentic Blog Writer.
+#
+# Services:
+#   blogwriter-api     -> FastAPI Web Service  (uvicorn, listens on $PORT)
+#   blogwriter-worker  -> RQ Background Worker (python -m app.worker)
+#   blogwriter-db      -> Render PostgreSQL (jobs, users, LangGraph checkpoints)
+#   blogwriter-cache   -> Render Key Value, Redis-compatible (queue, cache, rate limits)
+#
+# Secrets (GEMINI/GROQ/TAVILY/..., JWT_SECRET_KEY, ...) are NEVER committed:
+# they are declared below with `sync: false` so Render prompts for them on
+# Blueprint install and stores them in its own encrypted vault.
+services:
+  - type: web
+    name: blogwriter-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Default command comes from the Dockerfile CMD, which expands $PORT
+    # (Render-injected) with an 8000 fallback for local docker runs.
+    healthCheckPath: /api/v1/health
+    # Idempotent table creation (CREATE ... IF NOT EXISTS only). Safe to run
+    # on every deploy; exits non-zero (blocking the deploy) when the
+    # database is unreachable.
+    preDeployCommand: python scripts/render_init_db.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: blogwriter-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: blogwriter-cache
+          property: connectionString
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_FALLBACK_MODELS
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+
+  - type: worker
+    name: blogwriter-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python -m app.worker
+    # NOTE: Background Workers have NO free tier on Render. Pick the cheapest
+    # paid plan (Starter) in the dashboard during Blueprint install. The queue
+    # (same REDIS_URL) and database are shared with the web service. If the
+    # worker is not running, the API automatically falls back to its
+    # in-process thread executor — but thread jobs die with the process, so
+    # run the worker in production.
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: blogwriter-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: blogwriter-cache
+          property: connectionString
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_FALLBACK_MODELS
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+
+databases:
+  # Free tier: 1 GB, 30-day expiry, single instance per workspace, no backups.
+  # Fine for evaluation; upgrade the plan for anything real.
+  - name: blogwriter-db
+    databaseName: blogwriter
+    user: blogwriter
+    plan: free
+
+keyvalue:
+  # Free tier: in-memory ONLY — data is lost on every restart/maintenance.
+  # Queue entries, whole-blog cache and rate-limit counters are all
+  # reconstructible/re-runnable, so this is acceptable for evaluation;
+  # upgrade to a paid plan (disk-backed) for anything real.
+  - name: blogwriter-cache
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: [] # private-network only: api + worker in the same region
