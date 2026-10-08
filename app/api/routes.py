@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jwt.exceptions import InvalidTokenError
 from app.api.schemas import (
@@ -106,13 +106,17 @@ def generate(
     user_id: Annotated[str, Depends(get_current_user)],
 ):
     _require_rate_limit(user_id)
-    as_of = (req.as_of or date.today()).isoformat()
+    # Backend-owned: always today's date. The user cannot send a custom
+    # date — the field was removed from the API schema and the frontend.
+    as_of = date.today().isoformat()
     try:
         job_id = JOB_MANAGER.submit(
             user_id,
             req.topic,
             as_of,
             preferred_model=req.preferred_model,
+            enable_images=req.enable_images,
+            image_api_key=req.image_api_key,
         )
     except RuntimeError as exc:
         raise HTTPException(

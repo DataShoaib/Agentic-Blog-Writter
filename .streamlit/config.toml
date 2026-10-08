@@ -1,13 +1,10 @@
 [theme]
-base = "dark"
-primaryColor = "#c9974c"
-backgroundColor = "#10121b"
-secondaryBackgroundColor = "#171a26"
-textColor = "#eceef5"
-font = "sans serif"
-
-[server]
-headless = true
-
-[browser]
-gatherUsageStats = false
+# base MUST be "light" here — not a stylistic choice. The dataframe/JSON
+# viewer widgets are canvas-rendered and take their colors ONLY from this
+# file's theme.*, never from CSS. Our app's dark chrome (sidebar, canvas,
+# buttons) is all forced by !important CSS regardless of this setting, so
+# flipping base to light does not undo that. What it does fix: with
+# base="dark" the canvas widgets kept using textColor #eceef5 (near-white)
+# sitting on the cream paper card -> invisible. With base="light" and the
+# colors below, they render dark ink text on a cream background instead —
+# matching the paper card exactly.

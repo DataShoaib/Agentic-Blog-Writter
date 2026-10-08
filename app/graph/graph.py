@@ -29,10 +29,12 @@ TRANSIENT_NODE_RETRY = RetryPolicy(
 
 
 def build_graph(checkpointer=None):
-    """Compile the graph with a real checkpointer by default.
+    """Compile the graph.
 
     Default selection (see app.graph.checkpointer.get_default_checkpointer):
-    - InMemorySaver: local dev and hermetic tests.
+    - PostgresSaver: production, shared across worker processes.
+    Pass an explicit saver (e.g. InMemorySaver) for tests and the eval runner
+    so they stay hermetic — ``None`` means "use the production default".
     """
     if checkpointer is None:
         checkpointer = get_default_checkpointer()

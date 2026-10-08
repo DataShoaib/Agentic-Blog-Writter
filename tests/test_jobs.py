@@ -15,7 +15,7 @@ def _clean_test_jobs(requires_db):
     """
     store = JobStore()
     with store._lock, store._connect() as conn:
-        conn.execute(db.q("DELETE FROM jobs WHERE job_id IN ('job-1', 'job-2')"))
+        conn.execute(db.q("DELETE FROM jobs WHERE job_id IN ('job-1', 'job-2', 'job-w', 'job-a')"))
         conn.commit()
     yield
 
@@ -55,3 +55,20 @@ def test_list_blogs_returns_only_own_blogs():
 
     assert store.list_by_user("user-2")[0]["job_id"] == "job-2"
     assert store.list_by_user("user-with-no-blogs") == []
+
+
+def test_mark_interrupted_jobs_scopes_to_executor():
+    """The worker must not reap API-owned thread jobs (and vice versa) —
+    cross-kill used to fail live jobs on every restart of the other process."""
+    store = JobStore()
+    store.create("job-w", "user-1", "t", "2026-09-28")
+    store.update("job-w", status="running", executor="worker")
+    store.create("job-a", "user-1", "t", "2026-09-28")
+    store.update("job-a", status="running", executor="api")
+
+    store.mark_interrupted_jobs(executor="worker")
+    assert store.get("job-w", "user-1")["status"] == "failed"
+    assert store.get("job-a", "user-1")["status"] == "running"
+
+    store.mark_interrupted_jobs(executor="api")
+    assert store.get("job-a", "user-1")["status"] == "failed"

@@ -8,3 +8,5 @@ images/
 *.log
 !images/.gitkeep
 .DS_Store
+logs/
+app/evaluation/results/

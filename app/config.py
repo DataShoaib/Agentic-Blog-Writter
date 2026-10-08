@@ -15,6 +15,7 @@ class Secrets(BaseSettings):
     tavily_api_key: str = ""
     google_api_key: str = ""
     langsmith_api_key: str = ""
+    groq_api_key: str = ""
     jwt_secret_key: str = ""
     redis_url: str = ""
     database_url: str = ""
@@ -33,40 +34,42 @@ class Secrets(BaseSettings):
 class AppConfig:
     """Committed application behaviour; change here, not in .env."""
 
-    # All chat models are full litellm routes. Gemini is primary; the
-    # fallbacks are additional Gemini variants so the same API key serves
-    # every candidate. Each model carries its OWN free-tier daily quota
-    # (~20 req/day), so a longer candidate list multiplies the free budget.
-    # The list is verified against the live Gemini ListModels endpoint:
-    # legacy ids (2.0-flash, 1.5-flash, 2.5-pro) have been decommissioned.
+    # All chat models are full litellm routes. Gemini is primary; each model
+    # carries its OWN free-tier daily quota, so a longer candidate list
+    # multiplies the free budget. Verified live 2026-09-23 (probe script):
+    # dead IDs (404) were dropped — gemini-2.5-flash-lite, gemini-2.0-flash,
+    # groq llama-3.3-70b-versatile, groq llama-3.1-8b-instant.
     llm_model: str = "gemini/gemini-2.5-flash"
     llm_fallback_models: tuple[str, ...] = (
         "gemini/gemini-3.5-flash-lite",
         "gemini/gemini-3.1-flash-lite",
         "gemini/gemini-3.6-flash",
         "gemini/gemini-flash-latest",
+        # Groq free tier — separate quota bucket, needs GROQ_API_KEY.
+        "groq/openai/gpt-oss-20b",
+        "groq/openai/gpt-oss-120b",
     )
     image_model: str = "gemini-2.5-flash-image"
-    # Live-verified (Gemini ListModels, 2026-09) image-capable models. Each
-    # carries its own free-tier quota, so a dead primary can still yield an
-    # image via the retry loop in app/services/images.py.
+    # Image-capable models, each with its own free-tier quota.
     image_fallback_models: tuple[str, ...] = (
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-image-preview",
         "gemini-3.1-flash-lite-image",
         "gemini-3-pro-image",
     )
-    max_workers: int = 4
+    max_workers: int = 8
     max_revision_attempts: int = 1
     max_research_results: int = 3
     max_research_queries: int = 4
     request_timeout_seconds: int = 60
     job_timeout_seconds: int = 900
-    search_timeout_seconds: int = 20
-    image_timeout_seconds: int = 90
-    cache_ttl_seconds: int = 900
     rate_limit_per_minute: int = 10
-    worker_start_delay_seconds: float = 1.0
+    # Task-specific models for classification/evaluation-only nodes. These
+    # point at WORKING lite routes (not the daily-capped primary): when the
+    # primary hits its ~20 req/day Gemini free quota, the router calls that
+    # start every job still get through instead of dying at step one.
+    router_model: str = "gemini/gemini-3.5-flash-lite"
+    quality_gate_model: str = "gemini/gemini-3.5-flash-lite"
 
 
 APP_CONFIG = AppConfig()

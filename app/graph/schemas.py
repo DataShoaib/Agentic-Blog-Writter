@@ -78,13 +78,6 @@ class ImageSpec(BaseModel):
 
 
 class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str = Field(
-        "",
-        description=(
-            "Legacy echo field. Placeholders are auto-injected into the full "
-            "article by the graph node, so leave this empty."
-        ),
-    )
     images: list[ImageSpec] = Field(default_factory=list)
 
 
@@ -94,11 +87,3 @@ class QualityResult(BaseModel):
     completeness_score: float = Field(ge=0, le=1)
     citation_score: float = Field(ge=0, le=1)
     issues: list[str] = Field(default_factory=list, max_length=12)
-
-
-class EvaluationResult(BaseModel):
-    factuality_score: float = Field(ge=0, le=1)
-    completeness_score: float = Field(ge=0, le=1)
-    citation_score: float = Field(ge=0, le=1)
-    criterion_scores: dict[str, float] = Field(default_factory=dict)
-    notes: list[str] = Field(default_factory=list, max_length=10)

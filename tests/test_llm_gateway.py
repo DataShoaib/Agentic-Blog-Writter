@@ -23,6 +23,10 @@ def _resp(content, model="gemini/primary", usage=None):
 def gateway(monkeypatch):
     def install(models, handler):
         monkeypatch.setattr(llm, "model_candidates", lambda: list(models))
+        monkeypatch.setattr(
+            llm, "structured_candidates",
+            lambda: [m for m in models if not m.startswith("groq/")],
+        )
         monkeypatch.setattr(llm, "_get_router", lambda: SimpleNamespace(completion=handler))
         monkeypatch.setattr(llm, "get_secrets", lambda: SimpleNamespace(gemini_api_key="test-key", llm_model=""))
     return install
@@ -83,6 +87,25 @@ def test_structured_output_uses_selected_model(gateway):
     assert result.value == 42
 
 
+def test_structured_output_skips_groq_routes(gateway):
+    """Groq strict schema validation rejects our payloads — structured calls
+    must only ride Gemini routes, even when Groq models are candidates."""
+    class Judge(BaseModel):
+        value: int
+
+    seen: list[str] = []
+
+    def handler(**kwargs):
+        seen.append(kwargs.get("model"))
+        return _resp(json.dumps({"value": 1}), kwargs.get("model"))
+
+    gateway(["groq/openai/gpt-oss-20b", "gemini/primary"], handler)
+
+    result = llm.invoke_structured(Judge, [SimpleNamespace(content="hi")], operation="t-nogroq")
+    assert result.value == 1
+    assert seen == ["gemini/primary"]
+
+
 def test_structured_output_parses_prose_wrapped_json(gateway):
     class Judge(BaseModel):
         value: int
@@ -140,3 +163,25 @@ def test_structured_output_malformed_json_raises_gateway_error(gateway):
 
     with pytest.raises(llm.LLMGatewayError):
         llm.invoke_structured(Judge, [SimpleNamespace(content="hi")], operation="t-malformed")
+
+
+def test_structured_empty_chain_raises_gateway_error(gateway):
+    """An all-groq config leaves the Gemini-only structured chain empty —
+    it must raise LLMGatewayError (the type callers degrade on), never a
+    bare AssertionError from a loop that never runs."""
+    from pydantic import BaseModel as _BM
+
+    class Judge(_BM):
+        value: int
+
+    seen: list[str] = []
+
+    def handler(**kwargs):
+        seen.append(kwargs.get("model"))
+        return _resp('{"value": 1}', kwargs.get("model"))
+
+    gateway(["groq/openai/gpt-oss-20b"], handler)  # structured_candidates() == []
+
+    with pytest.raises(llm.LLMGatewayError, match="no structured"):
+        llm.invoke_structured(Judge, [SimpleNamespace(content="hi")], operation="t-emptychain")
+    assert seen == []  # the router must never be consulted

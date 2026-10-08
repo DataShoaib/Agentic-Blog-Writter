@@ -31,10 +31,14 @@ def _normalize(results: object) -> list[EvidenceItem]:
 
 
 def search_web(query: str, max_results: int = 6) -> list[EvidenceItem]:
-    if not get_secrets().tavily_api_key:
+    api_key = get_secrets().tavily_api_key
+    if not api_key:
         return []
     try:
-        return _normalize(TavilySearch(max_results=max(1, min(max_results, APP_CONFIG.max_research_results)), topic="general").invoke({"query": query}))
+        # Pass the key explicitly: pydantic-settings reads .env itself and does
+        # NOT export it to os.environ, so TavilySearch would fail to find
+        # TAVILY_API_KEY outside docker-compose (where env_file exports it).
+        return _normalize(TavilySearch(tavily_api_key=api_key, max_results=max(1, min(max_results, APP_CONFIG.max_research_results)), topic="general").invoke({"query": query}))
     except Exception as exc:
         if _is_transient_error(exc):
             raise TransientSearchError("Tavily search temporarily failed.") from exc

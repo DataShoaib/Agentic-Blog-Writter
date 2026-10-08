@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -28,8 +27,9 @@ class SignupResponse(BaseModel):
 
 class GenerateRequest(BaseModel):
     topic: str = Field(min_length=5, max_length=500)
-    as_of: date | None = None
     preferred_model: str | None = Field(default=None, max_length=200)
+    enable_images: bool = False
+    image_api_key: str | None = Field(default=None, max_length=200)
 
     @field_validator("topic")
     @classmethod

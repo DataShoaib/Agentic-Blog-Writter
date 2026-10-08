@@ -1,11 +1,11 @@
-from app.services.cache import LocalRateLimiter
 
+def test_redis_unavailable_fails_open_for_rate_limit(monkeypatch):
+    """Redis-only limiter: a store outage must not block legitimate requests."""
+    from app.services.cache import allow_request, get_redis_store
 
-def test_local_rate_limiter_blocks_after_limit():
-    limiter = LocalRateLimiter()
-    assert limiter.allow("u", 2)
-    assert limiter.allow("u", 2)
-    assert not limiter.allow("u", 2)
+    monkeypatch.setattr(get_redis_store(), "incr_with_expiry", lambda key, ttl: None)
+
+    assert allow_request("some-user") is True
 
 
 class _FixedWindowScript:

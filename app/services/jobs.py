@@ -11,13 +11,9 @@ from app.config import APP_CONFIG
 from app.graph.graph import build_graph
 from app.services import db
 from app.services.cache import get_blog_cache
+from app.services.images import clear_job_image_key, set_job_image_key
 
 JOB_QUEUE_NAME = "blog-generation"
-JOBS_DB_PATH = "jobs"
-
-# Personalization memory: rolling window of recent blogs per user
-_MEMORY_HEADINGS_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
-_MAX_MEMORY_ENTRIES = 5
 
 
 def _utc_now() -> str:
@@ -34,30 +30,6 @@ def _parse_json_column(raw: str | None) -> dict | list | None:
     return None
 
 
-def derive_memory_note(recent_blogs: list[dict]) -> str:
-    """Build a personalization note from a user's recent completed blogs.
-
-    Injected into planner/writer prompts so new articles avoid repeating
-    angles/titles and maintain tonal consistency. Derived from the jobs
-    table — no separate memory store needed.
-    """
-    if not recent_blogs:
-        return ""
-
-    lines = []
-    for blog in recent_blogs[:_MAX_MEMORY_ENTRIES]:
-        plan = blog.get("plan") or {}
-        title = (plan.get("blog_title") or blog.get("topic", ""))[:180]
-        topic = blog.get("topic", "")[:160]
-        sections = [m.strip() for m in _MEMORY_HEADINGS_RE.findall(blog.get("content", ""))][:6]
-        sections_str = ", ".join(sections) if sections else "n/a"
-        approx_words = len((blog.get("content") or "").split())
-
-        lines.append(f'- "{title}" (~{approx_words} words) | topic: {topic} | sections: {sections_str}')
-
-    return "\n".join(lines)
-
-
 class JobStore:
     """Registry for API-level job state and per-user ownership.
 
@@ -65,13 +37,12 @@ class JobStore:
     first DB operation requires a reachable Postgres; imports never connect.
     """
 
-    def __init__(self, path: str | None = None):
-        self.path = path or JOBS_DB_PATH
+    def __init__(self):
         self._lock = threading.Lock()
         self._ready = False
 
     def _connect(self):
-        return db.connect(self.path)
+        return db.connect()
 
     def _ensure_ready(self) -> None:
         if self._ready:
@@ -92,9 +63,10 @@ class JobStore:
                         error TEXT,
                         stage TEXT,
                         stage_detail TEXT,
-                        progress REAL,
+                        progress DOUBLE PRECISION,
                         plan_json TEXT,
                         evidence_json TEXT,
+                        executor TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
@@ -107,22 +79,37 @@ class JobStore:
                 # progress existed: ADD COLUMN IF NOT EXISTS is a safe no-op.
                 conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stage_detail TEXT")
                 conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress DOUBLE PRECISION")
+                # executor: which process owns the run — 'worker' (RQ) or
+                # 'api' (in-process thread fallback). NULL = row created
+                # before this column existed; treated as worker-owned when
+                # sweeping so legacy stragglers are still reaped.
+                conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS executor TEXT")
                 conn.commit()
             self._ready = True
 
-    def mark_interrupted_jobs(self) -> None:
+    def mark_interrupted_jobs(self, *, executor: str | None = None) -> None:
+        """Fail running jobs orphaned by a dead process.
+
+        ``executor='worker'`` reaps worker-owned rows (plus legacy NULL rows)
+        — called on worker startup. ``executor='api'`` reaps thread-fallback
+        rows from a previous API process — called on API startup, where every
+        such row is dead by definition (assumes ONE API instance; multi-
+        instance deployments should rely on the RQ worker path, see README
+        "Production path"). ``None`` reaps every running row.
+        """
         self._ensure_ready()
+        sql = (
+            "UPDATE jobs SET status='failed', error=?, updated_at=? "
+            "WHERE status='running'"
+        )
+        params: tuple = ("Job interrupted by application restart.", _utc_now())
+        if executor == "worker":
+            sql += " AND (executor IS NULL OR executor='worker')"
+        elif executor == "api":
+            sql += " AND executor=?"
+            params = (*params, executor)
         with self._lock, self._connect() as conn:
-            conn.execute(
-                db.q(
-                    """
-                    UPDATE jobs
-                    SET status='failed', error=?, updated_at=?
-                    WHERE status='running'
-                    """
-                ),
-                ("Job interrupted by application restart.", _utc_now()),
-            )
+            conn.execute(db.q(sql), params)
             conn.commit()
 
     def create(self, job_id: str, user_id: str, topic: str, as_of: str) -> None:
@@ -153,6 +140,7 @@ class JobStore:
         progress: float | None = None,
         plan: dict | None = None,
         evidence: list[dict] | None = None,
+        executor: str | None = None,
     ) -> None:
         self._ensure_ready()
         with self._lock, self._connect() as conn:
@@ -162,12 +150,13 @@ class JobStore:
                     UPDATE jobs
                     SET status=?, content=COALESCE(?, content), error=?, stage=COALESCE(?, stage),
                         stage_detail=COALESCE(?, stage_detail), progress=COALESCE(?, progress),
-                        plan_json=COALESCE(?, plan_json), evidence_json=COALESCE(?, evidence_json), updated_at=?
+                        plan_json=COALESCE(?, plan_json), evidence_json=COALESCE(?, evidence_json),
+                        executor=COALESCE(?, executor), updated_at=?
                     WHERE job_id=?
                     """
                 ),
                 (status, content, error, stage, stage_detail, progress, json.dumps(plan) if plan is not None else None,
-                 json.dumps(evidence) if evidence is not None else None, _utc_now(), job_id),
+                 json.dumps(evidence) if evidence is not None else None, executor, _utc_now(), job_id),
             )
             conn.commit()
 
@@ -191,6 +180,19 @@ class JobStore:
         result["plan"] = _parse_json_column(result.pop("plan_json"))
         result["evidence"] = _parse_json_column(result.pop("evidence_json"))
         return result
+
+    def get_progress(self, job_id: str) -> float:
+        """Last persisted progress fraction (0.0 when unknown) — seeds the
+        monotonic writer so a resumed run never moves the bar backwards."""
+        self._ensure_ready()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                db.q("SELECT progress FROM jobs WHERE job_id=?"), (job_id,)
+            ).fetchone()
+        try:
+            return float(row["progress"]) if row and row["progress"] is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _blog_title(record: dict) -> str:
@@ -235,6 +237,28 @@ class JobStore:
         return blogs
 
 
+def _mark_rq_failure(job, connection, exc_type, exc_value, tb=None, **_ignored) -> None:
+    """RQ ``on_failure`` hook — records failures ``run_job`` itself can't.
+
+    A hard timeout SIGKILLs the work horse, so run_job's own ``except``
+    never executes and the row would stay 'running' forever. Signature is
+    tolerant: RQ passes (job, connection, type, value, traceback).
+    """
+    try:
+        job_id = (job.args or [None])[0]
+        if not job_id:
+            return
+        JobStore().update(
+            job_id,
+            status="failed",
+            error=str(exc_value) or f"Job failed: {getattr(exc_type, '__name__', exc_type)}",
+            stage="failed",
+            stage_detail="Worker failure.",
+        )
+    except Exception:
+        pass  # never raise inside an RQ callback
+
+
 class JobManager:
     """Enqueue generation jobs while the shared database stores their durable status."""
 
@@ -272,8 +296,15 @@ class JobManager:
         topic: str,
         as_of: str,
         preferred_model: str | None = None,
+        enable_images: bool = False,
+        image_api_key: str | None = None,
     ) -> bool:
         """Put the job on the shared RQ queue."""
+        # Record ownership BEFORE enqueueing: setting it afterwards could
+        # race with a fast worker (update() would overwrite 'running' with
+        # 'queued'), and a crash between the two writes still leaves a
+        # correctly-owned 'queued' row.
+        self.store.update(job_id, status="queued", executor="worker")
         queue = self._get_queue()
         queue.enqueue(
             run_job,
@@ -282,8 +313,11 @@ class JobManager:
             topic,
             as_of,
             preferred_model,
+            enable_images,
+            image_api_key,
             job_id=job_id,
             retry=self._retry,
+            on_failure=_mark_rq_failure,
         )
         return True
 
@@ -293,11 +327,13 @@ class JobManager:
         topic: str,
         as_of: str,
         preferred_model: str | None = None,
+        enable_images: bool = False,
+        image_api_key: str | None = None,
     ) -> str:
         job_id = str(uuid.uuid4())
         self.store.create(job_id, user_id, topic, as_of)
 
-        cached = get_blog_cache().get(topic, as_of)
+        cached = get_blog_cache().get(topic, as_of, enable_images=enable_images)
         if cached is not None:
             self.store.update(
                 job_id,
@@ -316,7 +352,7 @@ class JobManager:
         self.execution_mode = "queued"
         try:
             self._enqueue_via_redis(
-                job_id, user_id, topic, as_of, preferred_model
+                job_id, user_id, topic, as_of, preferred_model, enable_images, image_api_key
             )
         except Exception:
             # Redis/RQ unavailable: fall back to running the job in a daemon
@@ -324,16 +360,23 @@ class JobManager:
             # the caller immediately receives 202 + job_id and polls
             # /jobs/{job_id} for progress, exactly like the queued path.
             self.execution_mode = "synchronous"
+            # Ownership recorded BEFORE the thread starts so an API restart
+            # can reap this row if the thread dies with the process.
+            self.store.update(job_id, status="queued", executor="api")
 
             def _run_inline() -> None:
                 try:
-                    run_job(job_id, user_id, topic, as_of, preferred_model)
+                    run_job(
+                        job_id, user_id, topic, as_of, preferred_model, enable_images, image_api_key
+                    )
                 except Exception as exc:
+                    # run_job records its own failure; this is a last-resort
+                    # net (e.g. DB error raised before run_job's try block).
                     self.store.update(
                         job_id,
                         status="failed",
                         error=str(exc) or "Synchronous generation failed.",
-                        stage="run",
+                        stage="failed",
                     )
 
             threading.Thread(target=_run_inline, name=f"job-{job_id}", daemon=True).start()
@@ -423,7 +466,11 @@ def _stream_graph_to_completion(
     ``initial_state=None`` resumes from the last checkpoint (crash resume).
     Returns the final full state dict.
     """
-    store.update(job_id, status="running", stage="router", progress=0.02)
+    # Do not touch progress here: on a crash-resume the row already holds
+    # the last fraction and rewriting 0.02 would move the bar backwards.
+    # Seed the monotonic writer from whatever is persisted instead.
+    store.update(job_id, status="running", stage="router")
+    last_progress = store.get_progress(job_id)
     final_state: dict = {}
     planned_total = 0
 
@@ -453,6 +500,11 @@ def _stream_graph_to_completion(
                 # Sections land gradually: interpolate writing progress between
                 # the planner and merge fractions instead of sitting flat.
                 done_fraction = 0.38 + 0.28 * (min(done, planned_total) / planned_total)
+            # Monotonic: the revise loop revisits 'quality' (0.80) after
+            # 'revise' (0.84), so NODE_PROGRESS ordering alone would let the
+            # bar jump backwards. The bar only ever moves forward.
+            done_fraction = max(done_fraction, last_progress)
+            last_progress = done_fraction
             store.update(
                 job_id,
                 status="running",
@@ -473,19 +525,19 @@ def run_job(
     topic: str,
     as_of: str,
     preferred_model: str | None = None,
+    enable_images: bool = False,
+    image_api_key: str | None = None,
 ) -> None:
     """RQ entry point executed by a separate worker process."""
     store = JobStore()
-    graph = build_graph()
-    store.update(job_id, status="running", error=None, stage="router")
-
     try:
-        memory_note = ""
-        try:
-            recent_blogs = store.list_by_user(user_id, limit=_MAX_MEMORY_ENTRIES)
-            memory_note = derive_memory_note(recent_blogs)
-        except Exception:
-            pass
+        graph = build_graph()
+        store.update(job_id, status="running", error=None, stage="router")
+        # The user's per-job image key must NOT enter GraphState: every state
+        # mutation is checkpointed to Postgres. Hold it in a process-local
+        # registry for this run instead — the graph executes in THIS process
+        # (RQ work horse or the thread fallback) and looks it up by job_id.
+        set_job_image_key(job_id, image_api_key)
         initial_state = {
             "topic": topic,
             "as_of": as_of,
@@ -493,10 +545,9 @@ def run_job(
             "evidence": [],
             "revision_count": 0,
             "max_revision_attempts": APP_CONFIG.max_revision_attempts,
-            "enable_images": True,
+            "enable_images": enable_images,
             "job_id": job_id,
             "user_id": user_id,
-            "memory_note": memory_note,
             "model": preferred_model,
         }
         config = {"configurable": {"thread_id": job_id}}
@@ -542,9 +593,21 @@ def run_job(
                 content,
                 plan_data,
                 evidence_data,
+                enable_images=enable_images,
             )
         except Exception:
             pass
     except Exception as exc:
-        store.update(job_id, status="failed", error=str(exc))
+        try:
+            store.update(
+                job_id,
+                status="failed",
+                error=str(exc),
+                stage="failed",
+                stage_detail="Generation failed.",
+            )
+        except Exception:
+            pass  # job store unreachable — RQ's on_failure hook is the backstop
         raise
+    finally:
+        clear_job_image_key(job_id)

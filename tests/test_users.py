@@ -15,6 +15,7 @@ def _clean_users(requires_db):
     reachable (no DB connect is even attempted in that case).
     """
     store = get_user_store()
+    store._ensure_ready()  # fresh databases have no users table yet
     with store._lock, store._connect() as conn:
         conn.execute(db.q("DELETE FROM users"))
         conn.commit()

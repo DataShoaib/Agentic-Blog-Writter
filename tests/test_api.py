@@ -16,12 +16,12 @@ def test_generate_returns_queued_job(monkeypatch):
     monkeypatch.setattr(
         JOB_MANAGER,
         "submit",
-        lambda user_id, topic, as_of, preferred_model=None: "job-test-1",
+        lambda user_id, topic, as_of, preferred_model=None, enable_images=False, image_api_key=None: "job-test-1",
     )
     client = TestClient(app)
     response = client.post(
         "/api/v1/generate",
-        json={"topic": "Explain production RAG evaluation", "as_of": "2026-08-20"},
+        json={"topic": "Explain production RAG evaluation"},
     )
     assert response.status_code == 202
     assert response.json()["job_id"] == "job-test-1"

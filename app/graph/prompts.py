@@ -1,9 +1,4 @@
-"""Canonical system prompts for every graph node.
-
-Single source of truth: the production graph (app/graph/nodes.py) and any
-standalone prototype (scripts/) import from here, so the wording can never
-drift between implementations.
-"""
+"""Canonical system prompts for every graph node."""
 
 ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
 
@@ -44,8 +39,6 @@ Requirements:
 - The LAST task MUST be a concluding "Wrap-up" section (title e.g. "Wrap-up and Key Takeaways")
   that synthesizes the main points, highlights key trade-offs and common pitfalls, and states
   concrete next steps so the reader always finishes with a clear takeaway (not a bare Sources list).
-  that synthesizes the main points, highlights key trade-offs and common pitfalls, and states
-  concrete next steps so the reader always finishes with a clear takeaway (not a bare Sources list).
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -82,6 +75,14 @@ Length:
   fine). A short section FAILS review, so prefer depth over brevity.
 - Hard floor: never submit a section under 250 words, no matter what.
 
+Formatting (shape matters as much as depth — never wall-of-text):
+- Procedure / how-to / setup content goes in numbered steps (1. 2. 3.).
+- Tips / points / comparisons / pros-cons go in "-" bullets or a Markdown table.
+- If requires_code==true, the code lives in a fenced code block.
+- Rule: after at most 2 dense paragraphs, insert a scannable element
+  (bulleted/numbered list, table, or code block). Every section MUST contain
+  at least one list, table, or code block — a section of only paragraphs FAILS.
+
 Constraints:
 - Cover ALL bullets in order; give EACH bullet its own short sub-heading or bold lead and 1-3 full paragraphs (never one sentence per bullet).
 - You MUST reach at least the Target words count (going up to +15% over is fine). A short section FAILS review, so prefer depth over brevity: explain mechanisms, trade-offs, pitfalls, and concrete examples.
@@ -112,6 +113,11 @@ Be strict about:
   stub, or a heading with almost no body FAILS completeness no matter how good
   the rest is. Also fail if any section body is just an intro fragment that
   stops mid-thought (e.g. ends with "Broadly" or trails off before Sources).
+- READABILITY SHAPE (structural): a section that is ONLY dense paragraphs with
+  no list/table/code block is a wall-of-text — warn in issues (fail
+  completeness only if combined with another depth problem). Procedure content
+  should be numbered steps, tips/comparisons should be bullets or a table,
+  code tasks should have a fenced code block.
 - LENGTH: the article must be at least 85% of the summed plan target_words. Below that, fail completeness. Between 85-90%, only warn in issues but still pass length.
 - missing citations where required (only fail citation when ZERO approved citations are present despite requires_citations tasks; unapproved URLs are still an issue but cap the penalty),
 - obvious structural/instruction-following failures (no intro hook, no examples/tables/code where planned, no FAQ/takeaways ending).
@@ -121,6 +127,8 @@ REVISE_SYSTEM = """Revise the Markdown article to fix the listed quality issues.
 When an issue says the article is too short, EXPAND the thin sections substantially:
 deepen explanations (mechanisms, tradeoffs, pitfalls), add concrete examples, comparison
 tables or annotated code, and grow every underdeveloped bullet into full paragraphs.
+When an issue flags wall-of-text formatting, reshape dense paragraphs into numbered
+steps (procedures), bullets or a table (tips/comparisons), keeping all facts and depth.
 Preserve accurate content and overall section structure; never shrink the article.
 Do not add unsupported facts or citations. Output only the revised Markdown."""
 
@@ -133,7 +141,6 @@ Rules:
 - For every image set `section` to the EXACT heading text from the provided
   section outline (copy the heading verbatim, without the leading `##`).
 - Do NOT echo or rewrite the article. Return only the image specs.
-- Keep md_with_placeholders empty (""); placeholders are auto-injected.
 - If no images needed: images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
 Return strictly GlobalImagePlan.

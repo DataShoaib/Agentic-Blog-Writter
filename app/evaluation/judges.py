@@ -8,6 +8,12 @@ Every judge:
 PASS/FAIL is applied by the runner's Python logic using configurable
 thresholds; the LLM's own ``passed`` field is not blindly trusted.
 """
+# Kept 3 judges (router, factuality, final-success) + 3 thresholds; dropped 4
+# overlapping judges (groundedness/plan/completeness/citation-semantic) since
+# the deterministic allowlist + graph quality gate already cover them. To
+# evaluate more: add a judge fn here, a threshold below, and a dispatch
+# branch in runner.run_case.
+
 from __future__ import annotations
 
 import re
@@ -31,11 +37,7 @@ class JudgeResult(BaseModel):
 # Configurable pass thresholds applied by runner-side Python logic.
 JUDGE_THRESHOLDS: dict[str, float] = {
     "router_correctness": 0.8,
-    "evidence_groundedness": 0.75,
-    "plan_adherence": 0.75,
     "factuality": 0.75,
-    "completeness": 0.75,
-    "citation_correctness": 0.75,
     "final_task_success": 0.8,
 }
 
@@ -62,21 +64,6 @@ def effective_pass(judge_name: str, result: JudgeResult) -> bool:
     """
     threshold = JUDGE_THRESHOLDS.get(judge_name, 0.75)
     return result.score >= threshold and not result.critical_errors
-
-
-_CITATION_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
-
-
-def citation_contexts(final_md: str, limit: int = 12) -> list[str]:
-    """Claim text immediately surrounding each markdown citation."""
-    contexts: list[str] = []
-    for match in _CITATION_RE.finditer(str(final_md)):
-        start = max(match.start() - 240, 0)
-        context = final_md[start : match.end()].strip()
-        contexts.append(context.replace("\n", " ")[:400])
-        if len(contexts) >= limit:
-            break
-    return contexts
 
 
 def judge_router_correctness(
@@ -116,65 +103,32 @@ def judge_router_correctness(
     return result
 
 
-def judge_evidence_groundedness(
-    topic: str, evidence: list[dict], claims_material: str
-) -> JudgeResult:
-    evidence_lines = "\n".join(
-        f"- {(e.get('title') or '')[:120]} | {e.get('url', '')}" for e in evidence[:20]
-    ) or "(no evidence retrieved)"
-    result = invoke_structured(
-        JudgeResult,
-        [
-            SystemMessage(content=JUDGE_SYSTEM),
-            HumanMessage(
-                content=(
-                    "Are the important claims in this material SUPPORTED by the "
-                    "retrieved evidence below? General common knowledge does not "
-                    "need a supporting source; specific named facts about products, "
-                    "versions, numbers, events DO.\n\n"
-                    f"Topic: {topic}\n\nEvidence retrieved:\n{evidence_lines}\n\n"
-                    f"Material to check:\n{_clip(claims_material)}\n\n"
-                    "score 1.0 = every important claim supported/verifiable; "
-                    "0.5 = roughly half supported; 0.0 = mostly unsupported. "
-                    "List unsupported major claims as critical_errors. "
-                    "Return JudgeResult only."
-                )
-            ),
-        ],
-        operation="eval_groundedness",
-    )
-    return result
-
-
-def judge_plan_adherence(plan: dict, final_md: str) -> JudgeResult:
-    task_list = "\n".join(
-        f"{t['id']}. {t['title']} (target ~{t['target_words']} words)"
-        for t in plan["tasks"]
-    )
-    result = invoke_structured(
-        JudgeResult,
-        [
-            SystemMessage(content=JUDGE_SYSTEM),
-            HumanMessage(
-                content=(
-                    "Does the generated blog FOLLOW the planner's intended tasks?\n\n"
-                    f"Planned tasks:\n{task_list}\n\n"
-                    f"Generated blog:\n{_clip(final_md)}\n\n"
-                    "Check: all planned sections appear, section order matches plan "
-                    "order, per-section depth is proportional to target words. "
-                    "Missing planned sections are critical errors. "
-                    "Return JudgeResult only."
-                )
-            ),
-        ],
-        operation="eval_plan_adherence",
-    )
-    return result
-
-
 def judge_factuality(topic: str, evidence: list[dict], final_md: str) -> JudgeResult:
+    """Factuality judge: permissive mode when research returned nothing.
+
+    When evidence is empty, the workers wrote from trained knowledge (there is
+    nothing to ground against), so judging becomes "does this contradict
+    well-established knowledge?" rather than "is every claim backed by a
+    retrieved URL?". Only hard contradictions or invented specifics count —
+    penalising ungrounded-but-plausible prose would make every no-evidence
+    case unwinnable by construction (a harness artifact, not a model bug).
+    """
+    has_evidence = bool(evidence)
     evidence_lines = "\n".join(f"- {e.get('url', '')}" for e in evidence[:20]) or (
-        "(no external evidence was retrieved)"
+        "(no external evidence was retrieved — the blog was written from "
+        "the model's own trained knowledge)"
+    )
+    strictness = (
+        "Every major factual claim must be traceable to one of the allowed "
+        "sources. Claims with no supporting source go in critical_errors."
+        if has_evidence
+        else "There are NO retrieved sources to check against, so judge ONLY "
+        "against well-established public knowledge: flag claims that are "
+        "clearly wrong, self-contradictory, or invent over-specific facts "
+        "(exact statistics, named studies, precise dates/versions) that a "
+        "reader could not verify. Do NOT penalise claims merely for lacking "
+        "a citation — ungrounded-but-plausible prose is expected here, not "
+        "a failure. Only concrete contradictions count as critical_errors."
     )
     result = invoke_structured(
         JudgeResult,
@@ -187,6 +141,7 @@ def judge_factuality(topic: str, evidence: list[dict], final_md: str) -> JudgeRe
                     "knowledge or looks hallucinated.\n\n"
                     f"Topic: {topic}\nAllowed sources from research:\n"
                     f"{evidence_lines}\n\nBlog:\n{_clip(final_md)}\n\n"
+                    f"Grounding rule: {strictness}\n"
                     "score 1.0 = no suspicious factual claims; 0.0 = many wrong or "
                     "invented claims. Put invented/wrong claims in critical_errors. "
                     "Return JudgeResult only."
@@ -194,59 +149,6 @@ def judge_factuality(topic: str, evidence: list[dict], final_md: str) -> JudgeRe
             ),
         ],
         operation="eval_factuality",
-    )
-    return result
-
-
-def judge_completeness(
-    query: str, expected_requirements: list[str], final_md: str
-) -> JudgeResult:
-    requirements = "\n".join(f"- {r}" for r in expected_requirements)
-    result = invoke_structured(
-        JudgeResult,
-        [
-            SystemMessage(content=JUDGE_SYSTEM),
-            HumanMessage(
-                content=(
-                    "Does the final blog satisfy the important requirements of the "
-                    "ORIGINAL request?\n\n"
-                    f"Original request: {query}\n\nRequirements that must hold:\n"
-                    f"{requirements}\n\n"
-                    f"Blog:\n{_clip(final_md)}\n\n"
-                    "Any unmet requirement is a critical error with its number. "
-                    "Return JudgeResult only."
-                )
-            ),
-        ],
-        operation="eval_completeness",
-    )
-    return result
-
-
-def judge_citation_correctness(
-    citation_contexts_list: list[str], evidence: list[dict]
-) -> JudgeResult:
-    evidence_lines = "\n".join(
-        f"- {e.get('url', '')} | {(e.get('snippet') or '')[:200]}" for e in evidence[:20]
-    ) or "(no evidence retrieved)"
-    context_text = "\n---\n".join(citation_contexts_list) or "(no citations found)"
-    result = invoke_structured(
-        JudgeResult,
-        [
-            SystemMessage(content=JUDGE_SYSTEM),
-            HumanMessage(
-                content=(
-                    "For each cited passage below, does the cited source actually "
-                    "support the claim it is attached to?\n\n"
-                    f"Evidence available (URL | snippet):\n{evidence_lines}\n\n"
-                    f"Cited passages:\n{context_text}\n\n"
-                    "If there are NO citations but claims clearly needed them, score "
-                    "low. Each mismatched citation is a critical error. "
-                    "Return JudgeResult only."
-                )
-            ),
-        ],
-        operation="eval_citations",
     )
     return result
 

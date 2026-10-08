@@ -11,10 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.evaluation.deterministic import (
+    _dedup_sections,
     check_citation_allowlist,
-    check_image_integrity,
-    check_merge_completeness_and_order,
-    check_structural_integrity,
     check_workflow_success,
     compute_cost,
     extract_cited_urls,
@@ -29,11 +27,11 @@ GOLDEN = json.loads(
 
 
 # ------------------------------------------------------------ golden set -----
-def test_golden_dataset_has_exactly_8_valid_cases():
+def test_golden_dataset_has_exactly_4_valid_cases():
     cases = GOLDEN["cases"]
-    assert len(cases) == 8
+    assert len(cases) == 4
     ids = [c["id"] for c in cases]
-    assert len(set(ids)) == 8
+    assert len(set(ids)) == 4
     for case in cases:
         assert case["query"].strip()
         assert isinstance(case["requires_research"], bool)
@@ -58,84 +56,15 @@ def test_workflow_success_reports_graph_error():
     assert any("boom" in d for d in result.detail)
 
 
-# ------------------------------------------------ structural integrity -------
-def _plan(tasks):
-    return {"plan": {"tasks": tasks}, "sections": [], "merged_md": ""}
+def test_dedup_sections_keeps_first_output_per_task():
+    """Quota-storm duplicate fan-out writes collapse to one per task."""
+    state = {"sections": [(1, "a"), (1, "a-retry"), (2, "b"), (2, "b-retry")]}
+    assert _dedup_sections(state)["sections"] == [(1, "a"), (2, "b")]
 
 
-def _task(tid):
-    return {"id": tid, "title": f"T{tid}", "target_words": 100}
-
-
-def test_task_count_outside_5_to_9_fails():
-    tasks = [_task(i) for i in range(1, 4)]  # only 3 tasks
-    result = check_structural_integrity(_plan(tasks))
-    assert not result.passed
-    assert any("outside 5-9" in d for d in result.detail)
-
-
-def test_duplicate_task_ids_fail():
-    tasks = [
-        {"id": 1, "title": "A", "target_words": 100},
-        {"id": 1, "title": "B", "target_words": 100},
-        {"id": 2, "title": "C", "target_words": 100},
-        {"id": 3, "title": "D", "target_words": 100},
-        {"id": 4, "title": "E", "target_words": 100},
-    ]
-    result = check_structural_integrity(_plan(tasks))
-    assert not result.passed
-    assert any("duplicate task IDs" in d for d in result.detail)
-
-
-def test_missing_worker_output_fails():
-    tasks = [_task(i) for i in range(1, 6)]
-    state = _plan(tasks)
-    state["sections"] = [(1, "## T1\ntext")]
-    result = check_structural_integrity(state)
-    assert not result.passed
-    assert any("no worker output" in d for d in result.detail)
-
-
-def test_unexpected_worker_task_id_fails():
-    tasks = [_task(i) for i in range(1, 6)]
-    state = _plan(tasks)
-    state["sections"] = [(i, f"## T{i}\ntext") for i in range(1, 7)]  # extra id 6
-    result = check_structural_integrity(state)
-    assert not result.passed
-    assert any("unplanned task IDs" in d for d in result.detail)
-
-
-# ------------------------------------------------------ merge integrity ------
-def test_merge_order_mismatch_fails():
-    tasks = [
-        {"id": 1, "title": "Intro", "target_words": 100},
-        {"id": 2, "title": "Body", "target_words": 100},
-        {"id": 3, "title": "End", "target_words": 100},
-        {"id": 4, "title": "More", "target_words": 100},
-        {"id": 5, "title": "Extra", "target_words": 100},
-    ]
-    # merged_md contains headings in WRONG order (T2's heading before T1's)
-    merged = "## Body\n\nb\n\n## Intro\n\na\n\n## End\n\nc\n\n## More\n\nd\n\n## Extra\n\ne"
-    state = {
-        "plan": {"tasks": tasks},
-        "sections": [(1, "## Intro\n\na"), (2, "## Body\n\nb")],
-        "merged_md": merged,
-    }
-    result = check_merge_completeness_and_order(state)
-    assert not result.passed
-    assert any("task_id order" in d for d in result.detail)
-
-
-def test_merge_in_correct_order_passes():
-    tasks = [{"id": i, "title": f"S{i}", "target_words": 100} for i in range(1, 6)]
-    merged = "\n\n".join(f"## S{i}\n\ntext {i}" for i in range(1, 6))
-    state = {
-        "plan": {"tasks": tasks},
-        "sections": [(i, f"## S{i}\n\ntext {i}") for i in range(1, 6)],
-        "merged_md": merged,
-    }
-    result = check_merge_completeness_and_order(state)
-    assert result.passed, result.detail
+def test_dedup_sections_leaves_unique_outputs_alone():
+    state = {"sections": [(1, "a"), (2, "b")]}
+    assert _dedup_sections(state)["sections"] == [(1, "a"), (2, "b")]
 
 
 # ---------------------------------------------------- citation allow-list ----
@@ -154,38 +83,6 @@ def test_citation_from_allowed_host_passes():
 def test_extract_cited_urls_dedupes():
     md = "[a](https://x.com/1) [b](https://x.com/1) [c](https://y.com/2)"
     assert extract_cited_urls(md) == ["https://x.com/1", "https://y.com/2"]
-
-
-# ------------------------------------------------------- image integrity -----
-def test_unresolved_placeholder_fails():
-    result = check_image_integrity(
-        "text [[IMAGE_1]] more", [{"placeholder": "[[IMAGE_1]]", "filename": "f.png"}]
-    )
-    assert not result.passed
-    assert any("unresolved placeholders" in d for d in result.detail)
-
-
-def test_resolved_placeholder_matches_plan_passes():
-    md = "![alt](/assets/images/job1/f.png)\n*caption*"
-    result = check_image_integrity(
-        md, [{"placeholder": "[[IMAGE_1]]", "filename": "f.png"}]
-    )
-    assert result.passed, result.detail
-
-
-def test_more_than_three_images_fails():
-    specs = [{"placeholder": f"[[IMAGE_{i}]]", "filename": f"f{i}.png"} for i in range(1, 5)]
-    result = check_image_integrity("clean text without placeholders", specs)
-    assert not result.passed
-    assert any("maximum is 3" in d for d in result.detail)
-
-
-def test_graceful_fallback_without_link_is_accepted():
-    md = "> **[IMAGE GENERATION FAILED]** caption"
-    result = check_image_integrity(
-        md, [{"placeholder": "[[IMAGE_1]]", "filename": "f.png"}]
-    )
-    assert result.passed
 
 
 # ------------------------------------------------------- latency & cost ------

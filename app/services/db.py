@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from app.config import get_secrets
 
 
-def connect(path: str | None = None):
+def connect():
     """Open a PostgreSQL connection with dict-like rows.
 
     ``connect_timeout`` bounds the TCP/connection phase so a down database

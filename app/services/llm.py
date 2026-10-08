@@ -7,7 +7,7 @@ from typing import Any
 from litellm import Router
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from app.config import APP_CONFIG, get_secrets
+from app.config import APP_CONFIG, Secrets, get_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,27 @@ def model_candidates() -> list[str]:
     return models
 
 
+def structured_candidates() -> list[str]:
+    """Gemini-only chain for structured (JSON-schema) output.
+
+    Groq's gpt-oss models advertise JSON mode but enforce a strict
+    server-side schema validator that rejects our multi-field pydantic
+    payloads (planner/research_synthesis never survive it), so routing
+    structured calls there burns the whole attempt budget. Gemini serves
+    every structured call — primary first (when its daily quota allows),
+    then the lite fallbacks that each carry their own free quota.
+    Text calls (workers/revision) still use the full chain.
+    """
+    return [model for model in model_candidates() if not model.startswith("groq/")]
+
+
+def _api_key_for(model: str, secrets: Secrets) -> str:
+    """Each provider gets its own key: groq/ models -> GROQ_API_KEY, everything else -> Gemini."""
+    if model.startswith("groq/"):
+        return secrets.groq_api_key
+    return secrets.gemini_api_key
+
+
 def _build_router() -> Router:
     secrets = get_secrets()
     return Router(
@@ -76,7 +97,7 @@ def _build_router() -> Router:
                 "model_name": model,
                 "litellm_params": {
                     "model": model,
-                    "api_key": secrets.gemini_api_key,
+                    "api_key": _api_key_for(model, secrets),
                     "timeout": APP_CONFIG.request_timeout_seconds,
                 },
             }
@@ -115,7 +136,9 @@ def _to_messages(messages: list[Any]) -> list[dict[str, str]]:
 
 
 def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model: str | None = None, max_tokens: int, response_format: type[BaseModel] | None = None, temperature: float = 0) -> Any:
-    candidates = model_candidates()
+    # Structured output only rides Gemini routes — Groq's strict schema
+    # validator rejects our pydantic payloads (see structured_candidates).
+    candidates = structured_candidates() if response_format is not None else model_candidates()
 
     # Ordered try-list: the user's preferred model first, then every other
     # candidate. This guarantees a real failover chain — requesting an exact
@@ -124,6 +147,17 @@ def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model
         ordered = [preferred_model, *(model for model in candidates if model != preferred_model)]
     else:
         ordered = list(candidates)
+
+    if not ordered:
+        # All-groq config with a structured call: the Gemini-only chain is
+        # empty. Fail with the error type callers already degrade on — never
+        # fall through to a bare AssertionError.
+        chain = "structured (Gemini-only)" if response_format is not None else "text"
+        raise LLMGatewayError(
+            f"LLM operation {operation!r} has no {chain} models configured — "
+            "set LLM_MODEL / LLM_FALLBACK_MODELS in .env to at least one "
+            "gemini/* route."
+        )
 
     last_exc: Exception | None = None
     for index, model in enumerate(ordered):
@@ -148,7 +182,8 @@ def _complete(messages: list[dict[str, str]], *, operation: str, preferred_model
                 else:
                     time.sleep(1.0)
 
-    assert last_exc is not None
+    if last_exc is None:  # unreachable with a non-empty chain; guard for python -O
+        raise LLMGatewayError(f"LLM operation {operation!r} failed: no model was tried.")
     raise _friendly_gateway_error(operation, candidates, last_exc) from last_exc
 
 

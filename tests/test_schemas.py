@@ -13,6 +13,9 @@ def test_task_validation():
     assert task.target_words == 200
 
 
-def test_generate_request_parses_date():
-    request = GenerateRequest(topic="Explain production RAG", as_of="2026-08-20")
-    assert request.as_of.isoformat() == "2026-08-20"
+def test_generate_request_defaults():
+    request = GenerateRequest(topic="Explain production RAG")
+    assert request.topic == "Explain production RAG"
+    assert request.preferred_model is None
+    assert request.enable_images is False
+    assert request.image_api_key is None

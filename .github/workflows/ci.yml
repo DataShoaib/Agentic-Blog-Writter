@@ -8,8 +8,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      AUTH_REQUIRED: "false"
-      ENABLE_IMAGES: "false"
       GEMINI_API_KEY: "test-key"
     steps:
       - uses: actions/checkout@v4

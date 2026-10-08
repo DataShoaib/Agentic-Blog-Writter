@@ -5,10 +5,14 @@ from fastapi import HTTPException
 from app.config import get_secrets
 from app.security import auth
 
+# 40+ bytes: PyJWT warns (InsecureKeyLengthWarning) for HMAC keys below the
+# 32-byte RFC 7518 recommendation for SHA256 — even in tests.
+_TEST_SECRET = "unit-test-secret-0123456789abcdef0123456789abcdef"
+
 
 def test_authentication_helpers(monkeypatch):
     secrets = get_secrets()
-    monkeypatch.setattr(secrets, "jwt_secret_key", "test-secret")
+    monkeypatch.setattr(secrets, "jwt_secret_key", _TEST_SECRET)
 
     class UserStore:
         def get(self, username):
@@ -18,17 +22,17 @@ def test_authentication_helpers(monkeypatch):
     assert auth.authenticate("demo", "secret")
     assert not auth.authenticate("missing", "secret")
     token = auth.create_access_token("demo")
-    payload = jwt.decode(token, "test-secret", algorithms=[auth.JWT_ALGORITHM])
+    payload = jwt.decode(token, _TEST_SECRET, algorithms=[auth.JWT_ALGORITHM])
     assert payload["sub"] == "demo"
     assert payload["type"] == "access"
 
 
 def test_refresh_token_round_trip_and_type_enforcement(monkeypatch):
     secrets = get_secrets()
-    monkeypatch.setattr(secrets, "jwt_secret_key", "test-secret")
+    monkeypatch.setattr(secrets, "jwt_secret_key", _TEST_SECRET)
 
     refresh_token = auth.create_refresh_token("demo")
-    payload = jwt.decode(refresh_token, "test-secret", algorithms=[auth.JWT_ALGORITHM])
+    payload = jwt.decode(refresh_token, _TEST_SECRET, algorithms=[auth.JWT_ALGORITHM])
     assert payload["sub"] == "demo"
     assert payload["type"] == "refresh"
 
@@ -46,7 +50,7 @@ def test_refresh_token_round_trip_and_type_enforcement(monkeypatch):
 
 def test_issue_token_pair_returns_valid_pair(monkeypatch):
     secrets = get_secrets()
-    monkeypatch.setattr(secrets, "jwt_secret_key", "test-secret")
+    monkeypatch.setattr(secrets, "jwt_secret_key", _TEST_SECRET)
 
     access_token, refresh_token = auth.issue_token_pair("demo")
     assert auth.decode_token(access_token, expected_type="access") == "demo"
@@ -55,13 +59,13 @@ def test_issue_token_pair_returns_valid_pair(monkeypatch):
 
 def test_expired_token_is_rejected(monkeypatch):
     secrets = get_secrets()
-    monkeypatch.setattr(secrets, "jwt_secret_key", "test-secret")
+    monkeypatch.setattr(secrets, "jwt_secret_key", _TEST_SECRET)
 
     from datetime import datetime, timedelta, timezone
 
     expired = jwt.encode(
         {"sub": "demo", "type": "access", "exp": datetime.now(timezone.utc) - timedelta(hours=2)},
-        "test-secret",
+        _TEST_SECRET,
         algorithm=auth.JWT_ALGORITHM,
     )
     with pytest.raises(auth.InvalidTokenError):

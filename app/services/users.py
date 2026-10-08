@@ -6,13 +6,12 @@ from app.services import db
 
 
 class UserStore:
-    def __init__(self, path: str | None = None):
-        self.path = path or "users"
+    def __init__(self):
         self._lock = threading.Lock()
         self._ready = False
 
     def _connect(self):
-        return db.connect(self.path)
+        return db.connect()
 
     def _ensure_ready(self) -> None:
         if self._ready:

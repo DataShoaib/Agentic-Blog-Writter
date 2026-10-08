@@ -6,18 +6,22 @@ from redis import Redis
 from rq import SimpleWorker, Worker
 
 from app.config import get_secrets
+from app.observability.logging import setup_logging
 from app.observability.tracing import configure_langsmith
-from app.services.jobs import JOB_QUEUE_NAME, JOBS_DB_PATH, JobStore
+from app.services.jobs import JOB_QUEUE_NAME, JobStore
 
 
 def main() -> None:
+    setup_logging()
     configure_langsmith()
     redis_url = get_secrets().redis_url
     if not redis_url:
         raise RuntimeError("REDIS_URL must be configured to start the worker.")
 
     try:
-        JobStore(JOBS_DB_PATH).mark_interrupted_jobs()
+        # Reap worker-owned rows orphaned by a previous worker process
+        # (legacy NULL executor rows count as worker-owned).
+        JobStore().mark_interrupted_jobs(executor="worker")
     except Exception:
         pass
 

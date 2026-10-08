@@ -116,3 +116,16 @@ def test_job_submit_runs_when_cache_misses(monkeypatch):
     job = manager.store.get(job_id, "u")
     assert job["status"] == "queued"
 
+
+def test_blog_cache_separates_images_on_and_off():
+    """The images flag participates in the cache key: an images-ON request
+    must never be served a no-images article (and vice versa)."""
+    cache = _cache()
+    cache.set(TOPIC, AS_OF, "plain", {}, [])
+    assert cache.get(TOPIC, AS_OF).content == "plain"
+    assert cache.get(TOPIC, AS_OF, enable_images=True) is None
+
+    cache.set(TOPIC, AS_OF, "with-images", {}, [], enable_images=True)
+    assert cache.get(TOPIC, AS_OF, enable_images=True).content == "with-images"
+    assert cache.get(TOPIC, AS_OF).content == "plain"  # both coexist
+

@@ -117,7 +117,7 @@ FastAPI
 | Database | PostgreSQL (jobs, users, LangGraph checkpoints) |
 | Frontend | Streamlit |
 | Observability | LangSmith tracing |
-| Infra | Docker Compose (API, worker, Postgres, Redis), GitHub Actions CI |
+| Infra | Docker Compose (API, worker, Postgres, Redis), Render Blueprint, GitHub Actions CI |
 | Testing | Pytest (14 files, ~80 tests) |
 
 ---
@@ -177,6 +177,7 @@ agentic-blog-writer/
 │
 ├── Dockerfile
 ├── docker-compose.yml               # api + worker + postgres + redis
+├── render.yaml                      # Render blueprint: api + worker + postgres + key value
 ├── requirements.txt
 ├── pytest.ini
 ├── .env.example
@@ -230,6 +231,17 @@ streamlit run frontend/streamlit_app.py
 ```bash
 docker-compose up --build
 ```
+
+---
+
+## Render deployment
+
+The included Render Blueprint (`render.yaml`) provisions the whole stack —
+FastAPI web service, RQ background worker, Postgres (jobs/users/checkpoints)
+and a Redis-compatible Key Value instance (queue/cache/rate limits). See
+[RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md) for the full walkthrough:
+free-tier limits, the secrets table, the idempotent `preDeployCommand`, and
+step-by-step smoke tests for health, auth, job submission and worker output.
 
 ---
 
